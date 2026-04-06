@@ -1,0 +1,38 @@
+#+title: mysql-wire
+
+A pure Emacs Lisp MySQL wire protocol client.  It speaks the
+classic MySQL protocol directly and does not shell out to the =mysql= CLI.
+
+* Features
+
+- TLS connections
+- Authentication with =mysql_native_password=
+- Authentication with =caching_sha2_password=
+- Authentication with =sha256_password=
+- Prepared statements
+- Transactions
+- Support for MySQL 5.6+, MySQL 8.x, and MariaDB 10.11+
+
+* Usage
+
+#+begin_src emacs-lisp
+(require 'mysql-wire)
+
+(let* ((conn (mysql-wire-connect :host "127.0.0.1"
+                                 :port 3306
+                                 :user "root"
+                                 :password "secret"
+                                 :database "mydb"))
+       (result (mysql-wire-query conn "SELECT 1 AS n")))
+  (unwind-protect
+      (message "Rows: %S" (mysql-wire-result-rows result))
+    (mysql-wire-disconnect conn)))
+#+end_src
+
+* Installation
+
+Once submitted, install =mysql-wire= from MELPA.
+
+* License
+
+GPL-3.0-or-later
