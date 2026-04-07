@@ -1,4 +1,4 @@
-;;; mysql-wire.el --- Pure Elisp MySQL wire protocol client -*- lexical-binding: t; -*-
+;;; mysql.el --- Pure Elisp MySQL wire protocol client -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2025-2026 Lucius Chen
 
@@ -10,20 +10,20 @@
 ;; URL: https://github.com/LuciusChen/mysql.el
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
-;; This file is part of mysql-wire.
+;; This file is part of mysql.
 
-;; mysql-wire is free software: you can redistribute it and/or modify
+;; mysql is free software: you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
 ;; the Free Software Foundation, either version 3 of the License, or
 ;; (at your option) any later version.
 
-;; mysql-wire is distributed in the hope that it will be useful,
+;; mysql is distributed in the hope that it will be useful,
 ;; but WITHOUT ANY WARRANTY; without even the implied warranty of
 ;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 ;; GNU General Public License for more details.
 
 ;; You should have received a copy of the GNU General Public License
-;; along with mysql-wire.  If not, see <https://www.gnu.org/licenses/>.
+;; along with mysql.  If not, see <https://www.gnu.org/licenses/>.
 
 ;;; Commentary:
 
@@ -32,16 +32,16 @@
 ;;
 ;; Usage:
 ;;
-;;   (require 'mysql-wire)
+;;   (require 'mysql)
 ;;
-;;   (let ((conn (mysql-wire-connect :host "127.0.0.1"
+;;   (let ((conn (mysql-connect :host "127.0.0.1"
 ;;                              :port 3306
 ;;                              :user "root"
 ;;                              :password "secret"
 ;;                              :database "mydb")))
-;;     (let ((result (mysql-wire-query conn "SELECT * FROM users LIMIT 10")))
-;;       (mysql-wire-result-rows result))
-;;     (mysql-wire-disconnect conn))
+;;     (let ((result (mysql-query conn "SELECT * FROM users LIMIT 10")))
+;;       (mysql-result-rows result))
+;;     (mysql-disconnect conn))
 
 ;;; Code:
 
@@ -51,51 +51,51 @@
 
 ;;;; Error types
 
-(define-error 'mysql-wire-error "MySQL error")
-(define-error 'mysql-wire-connection-error "MySQL connection error" 'mysql-wire-error)
-(define-error 'mysql-wire-protocol-error "MySQL protocol error" 'mysql-wire-error)
-(define-error 'mysql-wire-auth-error "MySQL authentication error" 'mysql-wire-error)
-(define-error 'mysql-wire-query-error "MySQL query error" 'mysql-wire-error)
-(define-error 'mysql-wire-timeout "MySQL timeout" 'mysql-wire-error)
-(define-error 'mysql-wire-stmt-error "MySQL prepared statement error" 'mysql-wire-error)
+(define-error 'mysql-error "MySQL error")
+(define-error 'mysql-connection-error "MySQL connection error" 'mysql-error)
+(define-error 'mysql-protocol-error "MySQL protocol error" 'mysql-error)
+(define-error 'mysql-auth-error "MySQL authentication error" 'mysql-error)
+(define-error 'mysql-query-error "MySQL query error" 'mysql-error)
+(define-error 'mysql-timeout "MySQL timeout" 'mysql-error)
+(define-error 'mysql-stmt-error "MySQL prepared statement error" 'mysql-error)
 
 ;;;; Capability flags (MySQL protocol)
 
-(defconst mysql-wire--cap-long-password        #x00000001)
-(defconst mysql-wire--cap-found-rows           #x00000002)
-(defconst mysql-wire--cap-long-flag            #x00000004)
-(defconst mysql-wire--cap-connect-with-db      #x00000008)
-(defconst mysql-wire--cap-protocol-41          #x00000200)
-(defconst mysql-wire--cap-transactions         #x00002000)
-(defconst mysql-wire--cap-secure-connection    #x00008000)
-(defconst mysql-wire--cap-ssl                  #x00000800)
-(defconst mysql-wire--cap-plugin-auth          #x00080000)
-(defconst mysql-wire--cap-plugin-auth-lenenc   #x00200000)
-(defconst mysql-wire--cap-deprecate-eof        #x01000000)
+(defconst mysql--cap-long-password        #x00000001)
+(defconst mysql--cap-found-rows           #x00000002)
+(defconst mysql--cap-long-flag            #x00000004)
+(defconst mysql--cap-connect-with-db      #x00000008)
+(defconst mysql--cap-protocol-41          #x00000200)
+(defconst mysql--cap-transactions         #x00002000)
+(defconst mysql--cap-secure-connection    #x00008000)
+(defconst mysql--cap-ssl                  #x00000800)
+(defconst mysql--cap-plugin-auth          #x00080000)
+(defconst mysql--cap-plugin-auth-lenenc   #x00200000)
+(defconst mysql--cap-deprecate-eof        #x01000000)
 
 ;;;; TLS configuration
 
-(defgroup mysql-wire nil
+(defgroup mysql nil
   "Pure Elisp MySQL client."
   :group 'comm
-  :prefix "mysql-wire-")
+  :prefix "mysql-")
 
-(defcustom mysql-wire-tls-trustfiles nil
+(defcustom mysql-tls-trustfiles nil
   "List of CA certificate file paths for TLS verification."
   :type '(repeat file)
-  :group 'mysql-wire)
+  :group 'mysql)
 
-(defcustom mysql-wire-tls-keylist nil
+(defcustom mysql-tls-keylist nil
   "List of (CERT-FILE KEY-FILE) pairs for client certificates."
   :type '(repeat (list file file))
-  :group 'mysql-wire)
+  :group 'mysql)
 
-(defcustom mysql-wire-tls-verify-server t
+(defcustom mysql-tls-verify-server t
   "Whether to verify the server certificate during TLS handshake."
   :type 'boolean
-  :group 'mysql-wire)
+  :group 'mysql)
 
-(defun mysql-wire--normalize-ssl-mode (ssl-mode)
+(defun mysql--normalize-ssl-mode (ssl-mode)
   "Return the canonical TLS-disabling SSL-MODE, or nil when absent.
 MySQL's official spelling is `disabled'.  The compatibility alias `off' is
 also accepted."
@@ -106,42 +106,42 @@ also accepted."
          (member (downcase ssl-mode) '("disabled" "off")))
     'disabled)
    (t
-    (signal 'mysql-wire-connection-error
+    (signal 'mysql-connection-error
             (list (format "Unsupported ssl-mode %S (supported: disabled)" ssl-mode))))))
 
 ;;;; Column type constants
 
-(defconst mysql-wire-type-decimal     0 "MySQL DECIMAL column type.")
-(defconst mysql-wire-type-tiny        1 "MySQL TINYINT column type.")
-(defconst mysql-wire-type-short       2 "MySQL SMALLINT column type.")
-(defconst mysql-wire-type-long        3 "MySQL INT column type.")
-(defconst mysql-wire-type-float       4 "MySQL FLOAT column type.")
-(defconst mysql-wire-type-double      5 "MySQL DOUBLE column type.")
-(defconst mysql-wire-type-null        6 "MySQL NULL column type.")
-(defconst mysql-wire-type-timestamp   7 "MySQL TIMESTAMP column type.")
-(defconst mysql-wire-type-longlong    8 "MySQL BIGINT column type.")
-(defconst mysql-wire-type-int24       9 "MySQL MEDIUMINT column type.")
-(defconst mysql-wire-type-date       10 "MySQL DATE column type.")
-(defconst mysql-wire-type-time       11 "MySQL TIME column type.")
-(defconst mysql-wire-type-datetime   12 "MySQL DATETIME column type.")
-(defconst mysql-wire-type-year       13 "MySQL YEAR column type.")
-(defconst mysql-wire-type-varchar    15 "MySQL VARCHAR column type.")
-(defconst mysql-wire-type-bit        16 "MySQL BIT column type.")
-(defconst mysql-wire-type-json      245 "MySQL JSON column type.")
-(defconst mysql-wire-type-newdecimal 246 "MySQL DECIMAL (new) column type.")
-(defconst mysql-wire-type-enum      247 "MySQL ENUM column type.")
-(defconst mysql-wire-type-set       248 "MySQL SET column type.")
-(defconst mysql-wire-type-tiny-blob  249 "MySQL TINYBLOB column type.")
-(defconst mysql-wire-type-medium-blob 250 "MySQL MEDIUMBLOB column type.")
-(defconst mysql-wire-type-long-blob  251 "MySQL LONGBLOB column type.")
-(defconst mysql-wire-type-blob       252 "MySQL BLOB column type.")
-(defconst mysql-wire-type-var-string 253 "MySQL VAR_STRING column type.")
-(defconst mysql-wire-type-string     254 "MySQL STRING column type.")
-(defconst mysql-wire-type-geometry   255 "MySQL GEOMETRY column type.")
+(defconst mysql-type-decimal     0 "MySQL DECIMAL column type.")
+(defconst mysql-type-tiny        1 "MySQL TINYINT column type.")
+(defconst mysql-type-short       2 "MySQL SMALLINT column type.")
+(defconst mysql-type-long        3 "MySQL INT column type.")
+(defconst mysql-type-float       4 "MySQL FLOAT column type.")
+(defconst mysql-type-double      5 "MySQL DOUBLE column type.")
+(defconst mysql-type-null        6 "MySQL NULL column type.")
+(defconst mysql-type-timestamp   7 "MySQL TIMESTAMP column type.")
+(defconst mysql-type-longlong    8 "MySQL BIGINT column type.")
+(defconst mysql-type-int24       9 "MySQL MEDIUMINT column type.")
+(defconst mysql-type-date       10 "MySQL DATE column type.")
+(defconst mysql-type-time       11 "MySQL TIME column type.")
+(defconst mysql-type-datetime   12 "MySQL DATETIME column type.")
+(defconst mysql-type-year       13 "MySQL YEAR column type.")
+(defconst mysql-type-varchar    15 "MySQL VARCHAR column type.")
+(defconst mysql-type-bit        16 "MySQL BIT column type.")
+(defconst mysql-type-json      245 "MySQL JSON column type.")
+(defconst mysql-type-newdecimal 246 "MySQL DECIMAL (new) column type.")
+(defconst mysql-type-enum      247 "MySQL ENUM column type.")
+(defconst mysql-type-set       248 "MySQL SET column type.")
+(defconst mysql-type-tiny-blob  249 "MySQL TINYBLOB column type.")
+(defconst mysql-type-medium-blob 250 "MySQL MEDIUMBLOB column type.")
+(defconst mysql-type-long-blob  251 "MySQL LONGBLOB column type.")
+(defconst mysql-type-blob       252 "MySQL BLOB column type.")
+(defconst mysql-type-var-string 253 "MySQL VAR_STRING column type.")
+(defconst mysql-type-string     254 "MySQL STRING column type.")
+(defconst mysql-type-geometry   255 "MySQL GEOMETRY column type.")
 
 ;;;; Data structures
 
-(cl-defstruct mysql-wire-conn
+(cl-defstruct mysql-conn
   "A MySQL connection object."
   process
   (buf nil)
@@ -157,7 +157,7 @@ also accepted."
   tls
   (busy nil))
 
-(cl-defstruct mysql-wire-result
+(cl-defstruct mysql-result
   "A MySQL query result."
   connection
   status
@@ -169,20 +169,20 @@ also accepted."
 
 ;;;; Low-level I/O primitives
 
-(defun mysql-wire--ensure-data (conn n)
+(defun mysql--ensure-data (conn n)
   "Ensure at least N bytes beyond read-offset are available in CONN's buffer.
 Waits for data, resetting the idle deadline on each arrival.
-Signals `mysql-wire-timeout' or `mysql-wire-connection-error' on failure."
-  (let* ((proc (mysql-wire-conn-process conn))
-         (buf (mysql-wire-conn-buf conn))
-         (timeout (mysql-wire-conn-read-idle-timeout conn))
+Signals `mysql-timeout' or `mysql-connection-error' on failure."
+  (let* ((proc (mysql-conn-process conn))
+         (buf (mysql-conn-buf conn))
+         (timeout (mysql-conn-read-idle-timeout conn))
          (deadline (+ (float-time) timeout)))
     (with-current-buffer buf
-      (while (< (- (point-max) (+ (point-min) (mysql-wire-conn-read-offset conn))) n)
+      (while (< (- (point-max) (+ (point-min) (mysql-conn-read-offset conn))) n)
         (let ((remaining (- deadline (float-time)))
               (prev-size (- (point-max) (point-min))))
           (when (<= remaining 0)
-            (signal 'mysql-wire-timeout
+            (signal 'mysql-timeout
                     (list (format "Timed out waiting for %d bytes" n))))
           (if (accept-process-output proc remaining nil t)
               ;; Data arrived — reset the idle deadline.
@@ -192,28 +192,28 @@ Signals `mysql-wire-timeout' or `mysql-wire-connection-error' on failure."
             ;; any remaining queued output from the OS before giving up.
             (when (not (process-live-p proc))
               (accept-process-output nil 0.05 nil t)
-              (when (< (- (point-max) (+ (point-min) (mysql-wire-conn-read-offset conn))) n)
-                (signal 'mysql-wire-connection-error
+              (when (< (- (point-max) (+ (point-min) (mysql-conn-read-offset conn))) n)
+                (signal 'mysql-connection-error
                         (list "Connection closed by server"))))))))))
 
-(defun mysql-wire--read-bytes (conn n)
+(defun mysql--read-bytes (conn n)
   "Read N bytes from CONN's input buffer as a unibyte string.
 Advances read-offset without deleting buffer content."
-  (mysql-wire--ensure-data conn n)
-  (with-current-buffer (mysql-wire-conn-buf conn)
-    (let* ((off (mysql-wire-conn-read-offset conn))
+  (mysql--ensure-data conn n)
+  (with-current-buffer (mysql-conn-buf conn)
+    (let* ((off (mysql-conn-read-offset conn))
            (start (+ (point-min) off))
            (str (buffer-substring-no-properties start (+ start n))))
-      (setf (mysql-wire-conn-read-offset conn) (+ off n))
+      (setf (mysql-conn-read-offset conn) (+ off n))
       str)))
 
-(defun mysql-wire--read-byte (conn)
+(defun mysql--read-byte (conn)
   "Read a single byte from CONN, returning it as an integer."
-  (aref (mysql-wire--read-bytes conn 1) 0))
+  (aref (mysql--read-bytes conn 1) 0))
 
-(defun mysql-wire--read-int-le (conn n)
+(defun mysql--read-int-le (conn n)
   "Read a little-endian integer of N bytes from CONN."
-  (let ((bytes (mysql-wire--read-bytes conn n))
+  (let ((bytes (mysql--read-bytes conn n))
         (val 0)
         (i 0))
     (while (< i n)
@@ -221,55 +221,55 @@ Advances read-offset without deleting buffer content."
       (setq i (1+ i)))
     val))
 
-(defun mysql-wire--read-lenenc-int (conn)
+(defun mysql--read-lenenc-int (conn)
   "Read a length-encoded integer from CONN."
-  (let ((first (mysql-wire--read-byte conn)))
+  (let ((first (mysql--read-byte conn)))
     (cond
      ((< first #xfb) first)
-     ((= first #xfc) (mysql-wire--read-int-le conn 2))
-     ((= first #xfd) (mysql-wire--read-int-le conn 3))
-     ((= first #xfe) (mysql-wire--read-int-le conn 8))
-     (t (signal 'mysql-wire-protocol-error
+     ((= first #xfc) (mysql--read-int-le conn 2))
+     ((= first #xfd) (mysql--read-int-le conn 3))
+     ((= first #xfe) (mysql--read-int-le conn 8))
+     (t (signal 'mysql-protocol-error
                 (list (format "Invalid lenenc-int prefix: 0x%02x" first)))))))
 
-(defun mysql-wire--read-string-nul (conn)
+(defun mysql--read-string-nul (conn)
   "Read a NUL-terminated string from CONN."
   (let ((chars nil))
-    (cl-loop for b = (mysql-wire--read-byte conn)
+    (cl-loop for b = (mysql--read-byte conn)
              until (= b 0)
              do (push b chars))
     (apply #'unibyte-string (nreverse chars))))
 
-(defun mysql-wire--read-string-lenenc (conn)
+(defun mysql--read-string-lenenc (conn)
   "Read a length-encoded string from CONN."
-  (let ((len (mysql-wire--read-lenenc-int conn)))
+  (let ((len (mysql--read-lenenc-int conn)))
     (if (zerop len) ""
-      (mysql-wire--read-bytes conn len))))
+      (mysql--read-bytes conn len))))
 
 ;;;; Packet I/O
 
-(defun mysql-wire--read-packet (conn)
+(defun mysql--read-packet (conn)
   "Read one MySQL packet from CONN.
 Returns the payload as a unibyte string.  Handles packets split across
 multiple 16 MB fragments."
   (let ((payload nil)
         (more t))
     (while more
-      (let* ((len (mysql-wire--read-int-le conn 3))
-             (seq (mysql-wire--read-byte conn)))
-        (setf (mysql-wire-conn-sequence-id conn) (logand (1+ seq) #xff))
-        (let ((data (mysql-wire--read-bytes conn len)))
+      (let* ((len (mysql--read-int-le conn 3))
+             (seq (mysql--read-byte conn)))
+        (setf (mysql-conn-sequence-id conn) (logand (1+ seq) #xff))
+        (let ((data (mysql--read-bytes conn len)))
           (push data payload))
         (setq more (= len #xffffff))))
     ;; Bulk-flush all bytes consumed by this packet; one delete-region per packet.
-    (with-current-buffer (mysql-wire-conn-buf conn)
-      (let ((off (mysql-wire-conn-read-offset conn)))
+    (with-current-buffer (mysql-conn-buf conn)
+      (let ((off (mysql-conn-read-offset conn)))
         (when (> off 0)
           (delete-region (point-min) (+ (point-min) off))
-          (setf (mysql-wire-conn-read-offset conn) 0))))
+          (setf (mysql-conn-read-offset conn) 0))))
     (apply #'concat (nreverse payload))))
 
-(defun mysql-wire--int-le-bytes (value n)
+(defun mysql--int-le-bytes (value n)
   "Encode VALUE as a little-endian unibyte string of N bytes."
   (let ((bytes (make-string n 0))
         (i 0))
@@ -278,50 +278,50 @@ multiple 16 MB fragments."
       (setq i (1+ i)))
     bytes))
 
-(defun mysql-wire--lenenc-int-bytes (value)
+(defun mysql--lenenc-int-bytes (value)
   "Encode VALUE as a length-encoded integer unibyte string."
   (cond
    ((< value #xfb)
     (unibyte-string value))
    ((<= value #xffff)
-    (concat (unibyte-string #xfc) (mysql-wire--int-le-bytes value 2)))
+    (concat (unibyte-string #xfc) (mysql--int-le-bytes value 2)))
    ((<= value #xffffff)
-    (concat (unibyte-string #xfd) (mysql-wire--int-le-bytes value 3)))
+    (concat (unibyte-string #xfd) (mysql--int-le-bytes value 3)))
    (t
-    (concat (unibyte-string #xfe) (mysql-wire--int-le-bytes value 8)))))
+    (concat (unibyte-string #xfe) (mysql--int-le-bytes value 8)))))
 
-(defun mysql-wire--send-packet (conn payload)
+(defun mysql--send-packet (conn payload)
   "Send PAYLOAD as a MySQL packet on CONN.
 Automatically prepends the 4-byte header (3-byte length + 1-byte sequence id).
 Handles splitting payloads larger than 0xFFFFFF."
-  (let ((proc (mysql-wire-conn-process conn))
+  (let ((proc (mysql-conn-process conn))
         (offset 0)
         (total (length payload)))
     (while (>= (- total offset) #xffffff)
-      (let ((header (concat (mysql-wire--int-le-bytes #xffffff 3)
-                            (unibyte-string (mysql-wire-conn-sequence-id conn)))))
-        (setf (mysql-wire-conn-sequence-id conn)
-              (logand (1+ (mysql-wire-conn-sequence-id conn)) #xff))
+      (let ((header (concat (mysql--int-le-bytes #xffffff 3)
+                            (unibyte-string (mysql-conn-sequence-id conn)))))
+        (setf (mysql-conn-sequence-id conn)
+              (logand (1+ (mysql-conn-sequence-id conn)) #xff))
         (process-send-string proc header)
         (process-send-string proc (substring payload offset (+ offset #xffffff)))
         (cl-incf offset #xffffff)))
     (let* ((remaining (- total offset))
-           (header (concat (mysql-wire--int-le-bytes remaining 3)
-                           (unibyte-string (mysql-wire-conn-sequence-id conn)))))
-      (setf (mysql-wire-conn-sequence-id conn)
-            (logand (1+ (mysql-wire-conn-sequence-id conn)) #xff))
+           (header (concat (mysql--int-le-bytes remaining 3)
+                           (unibyte-string (mysql-conn-sequence-id conn)))))
+      (setf (mysql-conn-sequence-id conn)
+            (logand (1+ (mysql-conn-sequence-id conn)) #xff))
       (process-send-string proc header)
       (when (> remaining 0)
         (process-send-string proc (substring payload offset))))))
 
 ;;;; Authentication helpers
 
-(defun mysql-wire--sha1 (data)
+(defun mysql--sha1 (data)
   "Return the SHA-1 hash of DATA (a unibyte string) as a unibyte string."
   (let ((hex (secure-hash 'sha1 data nil nil t)))
     hex))
 
-(defun mysql-wire--xor-strings (a b)
+(defun mysql--xor-strings (a b)
   "XOR two equal-length unibyte strings A and B."
   (let* ((len (length a))
          (result (make-string len 0))
@@ -331,7 +331,7 @@ Handles splitting payloads larger than 0xFFFFFF."
       (setq i (1+ i)))
     result))
 
-(defun mysql-wire--auth-native-password (password salt)
+(defun mysql--auth-native-password (password salt)
   "Compute mysql_native_password auth response.
 PASSWORD is a plain-text string.  SALT is the 20-byte auth data from
 the server handshake.  Returns a 20-byte unibyte string.
@@ -340,13 +340,13 @@ Algorithm: SHA1(password) XOR SHA1(salt + SHA1(SHA1(password)))"
   (if (or (null password) (string-empty-p password))
       ""
     (let* ((pass-bytes (encode-coding-string password 'utf-8))
-           (sha1-pass (mysql-wire--sha1 pass-bytes))
-           (sha1-sha1-pass (mysql-wire--sha1 sha1-pass))
+           (sha1-pass (mysql--sha1 pass-bytes))
+           (sha1-sha1-pass (mysql--sha1 sha1-pass))
            (concat-salt (concat salt sha1-sha1-pass))
-           (sha1-concat (mysql-wire--sha1 concat-salt)))
-      (mysql-wire--xor-strings sha1-pass sha1-concat))))
+           (sha1-concat (mysql--sha1 concat-salt)))
+      (mysql--xor-strings sha1-pass sha1-concat))))
 
-(defun mysql-wire--auth-caching-sha2-password (password salt)
+(defun mysql--auth-caching-sha2-password (password salt)
   "Compute caching_sha2_password auth response.
 PASSWORD is a plain-text string.  SALT is the 20-byte nonce.
 Returns a 32-byte unibyte string.
@@ -359,11 +359,11 @@ Algorithm: SHA256(password) XOR SHA256(SHA256(SHA256(password)) + salt)"
            (sha256-sha256-pass (secure-hash 'sha256 sha256-pass nil nil t))
            (concat-data (concat sha256-sha256-pass salt))
            (sha256-concat (secure-hash 'sha256 concat-data nil nil t)))
-      (mysql-wire--xor-strings sha256-pass sha256-concat))))
+      (mysql--xor-strings sha256-pass sha256-concat))))
 
 ;;;; Handshake
 
-(defun mysql-wire--read-le-uint (packet pos n)
+(defun mysql--read-le-uint (packet pos n)
   "Read an unsigned little-endian integer of N bytes from PACKET at POS."
   (let ((val 0)
         (i 0))
@@ -372,13 +372,13 @@ Algorithm: SHA256(password) XOR SHA256(SHA256(SHA256(password)) + salt)"
       (setq i (1+ i)))
     val))
 
-(defun mysql-wire--parse-handshake-salt (conn packet pos salt-part1 auth-data-len)
+(defun mysql--parse-handshake-salt (conn packet pos salt-part1 auth-data-len)
   "Parse the second salt part and auth plugin from handshake PACKET at POS.
 CONN, SALT-PART1, and AUTH-DATA-LEN provide context.
 Returns a plist with :salt and :auth-plugin."
   (let ((salt-part2 ""))
-    (when (not (zerop (logand (mysql-wire-conn-capability-flags conn)
-                              mysql-wire--cap-secure-connection)))
+    (when (not (zerop (logand (mysql-conn-capability-flags conn)
+                              mysql--cap-secure-connection)))
       (let ((part2-len (max 13 (- auth-data-len 8))))
         (setq salt-part2 (substring packet pos (+ pos part2-len)))
         (cl-incf pos part2-len)
@@ -387,83 +387,83 @@ Returns a plist with :salt and :auth-plugin."
                    (= (aref salt-part2 (1- (length salt-part2))) 0))
           (setq salt-part2 (substring salt-part2 0 -1)))))
     (let ((auth-plugin nil))
-      (when (not (zerop (logand (mysql-wire-conn-capability-flags conn)
-                                mysql-wire--cap-plugin-auth)))
+      (when (not (zerop (logand (mysql-conn-capability-flags conn)
+                                mysql--cap-plugin-auth)))
         (when-let* ((nul-pos (cl-position 0 packet :start pos)))
           (setq auth-plugin (substring packet pos nul-pos))))
       (list :salt (concat salt-part1 salt-part2)
             :auth-plugin (or auth-plugin "mysql_native_password")))))
 
-(defun mysql-wire--parse-handshake-body (conn packet pos salt-part1)
+(defun mysql--parse-handshake-body (conn packet pos salt-part1)
   "Parse capability flags and auth data from PACKET at POS into CONN.
 SALT-PART1 is the first 8 bytes of the auth plugin data.
-Returns the result of `mysql-wire--parse-handshake-salt'."
+Returns the result of `mysql--parse-handshake-salt'."
   (cl-incf pos 9) ;; skip 8-byte salt-part1 + 1 filler byte
-  (setf (mysql-wire-conn-capability-flags conn) (mysql-wire--read-le-uint packet pos 2))
+  (setf (mysql-conn-capability-flags conn) (mysql--read-le-uint packet pos 2))
   (cl-incf pos 2)
-  (setf (mysql-wire-conn-character-set conn) (aref packet pos))
+  (setf (mysql-conn-character-set conn) (aref packet pos))
   (cl-incf pos 1)
-  (setf (mysql-wire-conn-status-flags conn) (mysql-wire--read-le-uint packet pos 2))
+  (setf (mysql-conn-status-flags conn) (mysql--read-le-uint packet pos 2))
   (cl-incf pos 2)
   ;; capability_flags high 2 bytes — merge with low
-  (setf (mysql-wire-conn-capability-flags conn)
-        (logior (mysql-wire-conn-capability-flags conn)
-                (ash (mysql-wire--read-le-uint packet pos 2) 16)))
+  (setf (mysql-conn-capability-flags conn)
+        (logior (mysql-conn-capability-flags conn)
+                (ash (mysql--read-le-uint packet pos 2) 16)))
   (cl-incf pos 2)
   (let ((auth-data-len (aref packet pos)))
     (cl-incf pos 11) ;; 1 auth_plugin_data_len + 10 reserved
-    (mysql-wire--parse-handshake-salt conn packet pos salt-part1 auth-data-len)))
+    (mysql--parse-handshake-salt conn packet pos salt-part1 auth-data-len)))
 
-(defun mysql-wire--parse-handshake (conn packet)
+(defun mysql--parse-handshake (conn packet)
   "Parse a HandshakeV10 PACKET and update CONN with server info.
 Returns a plist with :salt and :auth-plugin."
   (let ((pos 0))
     (unless (= (aref packet 0) 10)
-      (signal 'mysql-wire-protocol-error
+      (signal 'mysql-protocol-error
               (list (format "Unsupported protocol version: %d" (aref packet 0)))))
     (cl-incf pos)
     ;; server_version: NUL-terminated string
     (let ((nul-pos (cl-position 0 packet :start pos)))
-      (setf (mysql-wire-conn-server-version conn) (substring packet pos nul-pos))
+      (setf (mysql-conn-server-version conn) (substring packet pos nul-pos))
       (setq pos (1+ nul-pos)))
-    (setf (mysql-wire-conn-connection-id conn) (mysql-wire--read-le-uint packet pos 4))
+    (setf (mysql-conn-connection-id conn) (mysql--read-le-uint packet pos 4))
     (cl-incf pos 4)
     ;; auth_plugin_data_part_1 (8 bytes) + capability flags + auth data
     (let ((salt-part1 (substring packet pos (+ pos 8))))
-      (mysql-wire--parse-handshake-body conn packet pos salt-part1))))
+      (mysql--parse-handshake-body conn packet pos salt-part1))))
 
-(defun mysql-wire--client-capabilities (conn)
+(defun mysql--client-capabilities (conn)
   "Compute the client capability flags for CONN."
-  (logior mysql-wire--cap-long-password
-          mysql-wire--cap-found-rows
-          mysql-wire--cap-long-flag
-          mysql-wire--cap-protocol-41
-          mysql-wire--cap-transactions
-          mysql-wire--cap-secure-connection
-          mysql-wire--cap-plugin-auth
-          (if (mysql-wire-conn-tls conn) mysql-wire--cap-ssl 0)
-          (if (mysql-wire-conn-database conn) mysql-wire--cap-connect-with-db 0)))
+  (logior mysql--cap-long-password
+          mysql--cap-found-rows
+          mysql--cap-long-flag
+          mysql--cap-protocol-41
+          mysql--cap-transactions
+          mysql--cap-secure-connection
+          mysql--cap-plugin-auth
+          (if (mysql-conn-tls conn) mysql--cap-ssl 0)
+          (if (mysql-conn-database conn) mysql--cap-connect-with-db 0)))
 
-(defun mysql-wire--build-handshake-response (conn password salt auth-plugin)
+(defun mysql--build-handshake-response (conn password salt auth-plugin)
   "Build a HandshakeResponse41 packet for CONN.
 PASSWORD is the user password, SALT is the server nonce, AUTH-PLUGIN
 is the authentication plugin name."
-  (let* ((client-flags (mysql-wire--client-capabilities conn))
-         (auth-response (mysql-wire--compute-auth-response password salt auth-plugin))
+  (let* ((client-flags (mysql--client-capabilities conn))
+         (auth-response (mysql--compute-auth-response password salt auth-plugin))
          (parts nil))
-    (setf (mysql-wire-conn-capability-flags conn)
-          (logand client-flags (mysql-wire-conn-capability-flags conn)))
-    (push (mysql-wire--int-le-bytes client-flags 4) parts)
-    (push (mysql-wire--int-le-bytes #x00ffffff 4) parts)  ;; max_packet_size
+    (setf (mysql-conn-capability-flags conn)
+          (logand client-flags (mysql-conn-capability-flags conn)))
+    (push (mysql--int-le-bytes client-flags 4) parts)
+    (push (mysql--int-le-bytes #x00ffffff 4) parts)  ;; max_packet_size
     (push (unibyte-string 45) parts)                  ;; charset: utf8mb4
     (push (make-string 23 0) parts)                   ;; filler
-    (push (concat (encode-coding-string (mysql-wire-conn-user conn) 'utf-8)
+    (push (concat (encode-coding-string (mysql-conn-user conn) 'utf-8)
                   (unibyte-string 0))
           parts)
     (push (unibyte-string (length auth-response)) parts)
     (push auth-response parts)
-    (when (mysql-wire-conn-database conn)
-      (push (concat (encode-coding-string (mysql-wire-conn-database conn) 'utf-8)
+    (when (mysql-conn-database conn)
+      (push (concat (encode-coding-string (mysql-conn-database conn) 'utf-8)
                     (unibyte-string 0))
             parts))
     (push (concat (encode-coding-string auth-plugin 'utf-8)
@@ -471,25 +471,25 @@ is the authentication plugin name."
           parts)
     (apply #'concat (nreverse parts))))
 
-(defun mysql-wire--compute-auth-response (password salt auth-plugin)
+(defun mysql--compute-auth-response (password salt auth-plugin)
   "Compute auth response for the given AUTH-PLUGIN.
 PASSWORD is the plaintext password, SALT is the server nonce."
   (pcase auth-plugin
     ("mysql_native_password"
-     (mysql-wire--auth-native-password password salt))
+     (mysql--auth-native-password password salt))
     ("caching_sha2_password"
-     (mysql-wire--auth-caching-sha2-password password salt))
+     (mysql--auth-caching-sha2-password password salt))
     (_
-     (signal 'mysql-wire-auth-error
+     (signal 'mysql-auth-error
              (list (format "Unsupported auth plugin: %s" auth-plugin))))))
 
 ;;;; Response parsing helpers
 
-(defun mysql-wire--parse-ok-packet (packet)
+(defun mysql--parse-ok-packet (packet)
   "Parse an OK_Packet from PACKET (first byte 0x00 already verified).
 Returns a plist with :affected-rows, :last-insert-id, :status-flags, :warnings."
-  (pcase-let* ((`(,affected-rows . ,pos1) (mysql-wire--read-lenenc-int-from-string packet 1))
-               (`(,last-insert-id . ,pos) (mysql-wire--read-lenenc-int-from-string packet pos1))
+  (pcase-let* ((`(,affected-rows . ,pos1) (mysql--read-lenenc-int-from-string packet 1))
+               (`(,last-insert-id . ,pos) (mysql--read-lenenc-int-from-string packet pos1))
          (status-flags (when (< (1+ pos) (length packet))
                          (prog1 (logior (aref packet pos)
                                         (ash (aref packet (+ pos 1)) 8))
@@ -502,7 +502,7 @@ Returns a plist with :affected-rows, :last-insert-id, :status-flags, :warnings."
           :status-flags status-flags
           :warnings warnings)))
 
-(defun mysql-wire--parse-err-packet (packet)
+(defun mysql--parse-err-packet (packet)
   "Parse an ERR_Packet from PACKET (first byte 0xFF already verified).
 Returns a plist with :code, :state, :message."
   (let* ((code (logior (aref packet 1) (ash (aref packet 2) 8)))
@@ -517,11 +517,11 @@ Returns a plist with :code, :state, :message."
     (setq message (decode-coding-string (substring packet pos) 'utf-8))
     (list :code code :state state :message message)))
 
-(defun mysql-wire--parse-eof-packet (_packet)
+(defun mysql--parse-eof-packet (_packet)
   "Parse an EOF_Packet.  Returns t."
   t)
 
-(defun mysql-wire--packet-type (packet)
+(defun mysql--packet-type (packet)
   "Determine the type of PACKET from its first byte.
 Returns one of: ok, err, eof, local-infile, or data."
   (let ((first (aref packet 0)))
@@ -534,7 +534,7 @@ Returns one of: ok, err, eof, local-infile, or data."
 
 ;;;; Column definition parsing
 
-(defun mysql-wire--read-lenenc-int-from-string (str pos)
+(defun mysql--read-lenenc-int-from-string (str pos)
   "Read a length-encoded integer from STR at POS.
 Returns (value . new-pos)."
   (let ((first (aref str pos)))
@@ -556,20 +556,20 @@ Returns (value . new-pos)."
           (setq val (logior val (ash (aref str (+ pos 1 i)) (* i 8)))))
         (cons val (+ pos 9)))))))
 
-(defun mysql-wire--read-lenenc-string-from-string (str pos)
+(defun mysql--read-lenenc-string-from-string (str pos)
   "Read a length-encoded string from STR at POS.
 Returns (string . new-pos)."
-  (pcase-let* ((`(,len . ,p) (mysql-wire--read-lenenc-int-from-string str pos)))
+  (pcase-let* ((`(,len . ,p) (mysql--read-lenenc-int-from-string str pos)))
     (cons (substring str p (+ p len)) (+ p len))))
 
-(defun mysql-wire--parse-column-definition (packet)
+(defun mysql--parse-column-definition (packet)
   "Parse a Column Definition PACKET.
 Returns a plist with column metadata."
   ;; Read the 6 lenenc-string fields: catalog, schema, table, org_table, name, org_name
   (let* ((pos 0)
          (strings (cl-loop repeat 6
                            collect (pcase-let ((`(,str . ,new-pos)
-                                               (mysql-wire--read-lenenc-string-from-string packet pos)))
+                                               (mysql--read-lenenc-string-from-string packet pos)))
                                      (setq pos new-pos)
                                      (decode-coding-string str 'utf-8)))))
     ;; Fixed-length fields after 0x0c marker: offsets relative to pos+1
@@ -592,7 +592,7 @@ Returns a plist with column metadata."
 
 ;;;; Row parsing
 
-(defun mysql-wire--parse-result-row (packet column-count)
+(defun mysql--parse-result-row (packet column-count)
   "Parse a result row from PACKET with COLUMN-COUNT columns.
 Each column value is either NULL (0xFB prefix) or a lenenc-string."
   (let ((pos 0)
@@ -602,19 +602,19 @@ Each column value is either NULL (0xFB prefix) or a lenenc-string."
           (progn
             (push nil row)
             (cl-incf pos 1))
-        (pcase-let ((`(,val . ,new-pos) (mysql-wire--read-lenenc-string-from-string packet pos)))
+        (pcase-let ((`(,val . ,new-pos) (mysql--read-lenenc-string-from-string packet pos)))
           (push val row)
           (setq pos new-pos))))
     (nreverse row)))
 
 ;;;; Type conversion
 
-(defvar mysql-wire-type-parsers nil
+(defvar mysql-type-parsers nil
   "Alist of (TYPE-CODE . PARSER-FN) for custom type parsing.
 Each PARSER-FN takes a single string argument and returns the
 converted Elisp value.  Entries here override built-in parsers.")
 
-(defun mysql-wire--parse-date (value)
+(defun mysql--parse-date (value)
   "Parse MySQL DATE VALUE \"YYYY-MM-DD\" into a plist.
 Returns (:year Y :month M :day D), or nil for zero dates."
   (if (or (string= value "0000-00-00") (string-empty-p value))
@@ -624,7 +624,7 @@ Returns (:year Y :month M :day D), or nil for zero dates."
             :month (string-to-number m)
             :day (string-to-number d)))))
 
-(defun mysql-wire--parse-time (value)
+(defun mysql--parse-time (value)
   "Parse MySQL TIME VALUE \"[-]HH:MM:SS[.ffffff]\" into a plist.
 Returns (:hours H :minutes M :seconds S :negative BOOL)."
   (if (string-empty-p value)
@@ -639,7 +639,7 @@ Returns (:hours H :minutes M :seconds S :negative BOOL)."
               :seconds (string-to-number sec)
               :negative negative)))))
 
-(defun mysql-wire--parse-datetime (value)
+(defun mysql--parse-datetime (value)
   "Parse MySQL DATETIME/TIMESTAMP VALUE into a plist.
 Input: \"YYYY-MM-DD HH:MM:SS[.ffffff]\".
 Returns (:year Y :month M :day D :hours H :minutes M :seconds S),
@@ -660,97 +660,97 @@ or nil for zero datetimes."
               :minutes (string-to-number mi)
               :seconds (string-to-number s))))))
 
-(defun mysql-wire--parse-bit (value)
+(defun mysql--parse-bit (value)
   "Parse MySQL BIT binary VALUE into an integer."
   (let ((result 0))
     (dotimes (i (length value))
       (setq result (logior (ash result 8) (aref value i))))
     result))
 
-(defun mysql-wire--parse-typed-value (value type)
+(defun mysql--parse-typed-value (value type)
   "Parse non-null string VALUE according to MySQL column TYPE code."
-  (if-let* ((custom (alist-get type mysql-wire-type-parsers)))
+  (if-let* ((custom (alist-get type mysql-type-parsers)))
       (funcall custom value)
     (pcase type
       ((or 1 2 3 8 9)   (string-to-number value))  ;; integers
       ((or 4 5)         (string-to-number value))  ;; float/double
       ((or 0 246)       (string-to-number value))  ;; decimal/newdecimal
       (13               (string-to-number value))  ;; year
-      ((or 7 12)        (mysql-wire--parse-datetime value))
-      (10               (mysql-wire--parse-date value))
-      (11               (mysql-wire--parse-time value))
-      (16               (mysql-wire--parse-bit value))
+      ((or 7 12)        (mysql--parse-datetime value))
+      (10               (mysql--parse-date value))
+      (11               (mysql--parse-time value))
+      (16               (mysql--parse-bit value))
       (245
        (let ((s (decode-coding-string value 'utf-8)))
          (if (fboundp 'json-parse-string) (json-parse-string s) s)))
       (_                (decode-coding-string value 'utf-8)))))
 
-(defun mysql-wire--parse-value (value type)
+(defun mysql--parse-value (value type)
   "Parse string VALUE according to MySQL column TYPE code.
 Returns the converted Elisp value, or nil for SQL NULL."
-  (when value (mysql-wire--parse-typed-value value type)))
+  (when value (mysql--parse-typed-value value type)))
 
-(defun mysql-wire--convert-row (row columns)
+(defun mysql--convert-row (row columns)
   "Convert ROW values according to COLUMNS type information."
   (cl-mapcar (lambda (val col)
-               (mysql-wire--parse-value val (plist-get col :type)))
+               (mysql--parse-value val (plist-get col :type)))
              row columns))
 
 ;;;; TLS support
 
-(defun mysql-wire--tls-available-p ()
+(defun mysql--tls-available-p ()
   "Return non-nil if GnuTLS support is available in this Emacs."
   (and (fboundp 'gnutls-available-p) (gnutls-available-p)))
 
-(defun mysql-wire--build-ssl-request (conn)
+(defun mysql--build-ssl-request (conn)
   "Build a 32-byte SSL_REQUEST packet for CONN."
-  (let* ((client-flags (logior mysql-wire--cap-long-password
-                               mysql-wire--cap-found-rows
-                               mysql-wire--cap-long-flag
-                               mysql-wire--cap-protocol-41
-                               mysql-wire--cap-ssl
-                               mysql-wire--cap-transactions
-                               mysql-wire--cap-secure-connection
-                               mysql-wire--cap-plugin-auth
-                               (if (mysql-wire-conn-database conn)
-                                   mysql-wire--cap-connect-with-db
+  (let* ((client-flags (logior mysql--cap-long-password
+                               mysql--cap-found-rows
+                               mysql--cap-long-flag
+                               mysql--cap-protocol-41
+                               mysql--cap-ssl
+                               mysql--cap-transactions
+                               mysql--cap-secure-connection
+                               mysql--cap-plugin-auth
+                               (if (mysql-conn-database conn)
+                                   mysql--cap-connect-with-db
                                  0))))
-    (concat (mysql-wire--int-le-bytes client-flags 4)
-            (mysql-wire--int-le-bytes #x00ffffff 4)
+    (concat (mysql--int-le-bytes client-flags 4)
+            (mysql--int-le-bytes #x00ffffff 4)
             (unibyte-string 45)
             (make-string 23 0))))
 
-(defun mysql-wire--upgrade-to-tls (conn)
+(defun mysql--upgrade-to-tls (conn)
   "Upgrade CONN's network connection to TLS using GnuTLS."
-  (let ((proc (mysql-wire-conn-process conn)))
+  (let ((proc (mysql-conn-process conn)))
     (require 'gnutls)
     (gnutls-negotiate
      :process proc
-     :hostname (mysql-wire-conn-host conn)
-     :trustfiles mysql-wire-tls-trustfiles
-     :keylist mysql-wire-tls-keylist
-     :verify-hostname-error mysql-wire-tls-verify-server
-     :verify-error mysql-wire-tls-verify-server)
-    (setf (mysql-wire-conn-tls conn) t)))
+     :hostname (mysql-conn-host conn)
+     :trustfiles mysql-tls-trustfiles
+     :keylist mysql-tls-keylist
+     :verify-hostname-error mysql-tls-verify-server
+     :verify-error mysql-tls-verify-server)
+    (setf (mysql-conn-tls conn) t)))
 
-(defun mysql-wire--cleanup-connection-resources (proc buf)
+(defun mysql--cleanup-connection-resources (proc buf)
   "Dispose of partially opened MySQL transport resources PROC and BUF."
   (when (process-live-p proc) (delete-process proc))
   (when (buffer-live-p buf) (kill-buffer buf)))
 
-(defun mysql-wire--caching-sha2-full-auth-requires-tls-p (err)
+(defun mysql--caching-sha2-full-auth-requires-tls-p (err)
   "Return non-nil when ERR is the caching_sha2 full-auth TLS requirement."
   (pcase err
-    (`(mysql-wire-auth-error ,message)
+    (`(mysql-auth-error ,message)
      (equal message "caching_sha2_password full authentication requires TLS"))
     (_ nil)))
 
-(defun mysql-wire--requested-tls-mode (tls tls-specified-p ssl-mode)
+(defun mysql--requested-tls-mode (tls tls-specified-p ssl-mode)
   "Return the requested TLS mode for TLS, TLS-SPECIFIED-P, and SSL-MODE.
 The return value is one of the symbols `default', `required', or `disabled'."
-  (let ((normalized-ssl-mode (mysql-wire--normalize-ssl-mode ssl-mode)))
+  (let ((normalized-ssl-mode (mysql--normalize-ssl-mode ssl-mode)))
     (when (and normalized-ssl-mode tls-specified-p tls)
-      (signal 'mysql-wire-connection-error
+      (signal 'mysql-connection-error
               (list "Conflicting MySQL TLS options: :tls t cannot be combined with :ssl-mode disabled")))
     (cond
      (normalized-ssl-mode 'disabled)
@@ -758,37 +758,37 @@ The return value is one of the symbols `default', `required', or `disabled'."
      (tls 'required)
      (t 'default))))
 
-(defun mysql-wire--retry-auth-with-tls-p (err tls-mode)
+(defun mysql--retry-auth-with-tls-p (err tls-mode)
   "Return non-nil when ERR should trigger a TLS reconnect retry.
 ERR is the condition data raised during authentication and TLS-MODE is the
 original connection mode."
   (and (eq tls-mode 'default)
-       (mysql-wire--tls-available-p)
-       (mysql-wire--caching-sha2-full-auth-requires-tls-p err)))
+       (mysql--tls-available-p)
+       (mysql--caching-sha2-full-auth-requires-tls-p err)))
 
 ;;;; Connection
 
-(defun mysql-wire--authenticate (conn password tls)
+(defun mysql--authenticate (conn password tls)
   "Perform the MySQL handshake and authentication sequence on CONN.
 PASSWORD is the plaintext password; TLS non-nil means upgrade to TLS first."
-  (let* ((handshake-packet (mysql-wire--read-packet conn))
-         (handshake-info (mysql-wire--parse-handshake conn handshake-packet))
+  (let* ((handshake-packet (mysql--read-packet conn))
+         (handshake-info (mysql--parse-handshake conn handshake-packet))
          (salt (plist-get handshake-info :salt))
          (auth-plugin (plist-get handshake-info :auth-plugin)))
     (when tls
-      (when (zerop (logand (mysql-wire-conn-capability-flags conn)
-                          mysql-wire--cap-ssl))
-        (signal 'mysql-wire-connection-error
+      (when (zerop (logand (mysql-conn-capability-flags conn)
+                          mysql--cap-ssl))
+        (signal 'mysql-connection-error
                 (list "Server does not support SSL")))
-      (setf (mysql-wire-conn-sequence-id conn) 1)
-      (mysql-wire--send-packet conn (mysql-wire--build-ssl-request conn))
-      (mysql-wire--upgrade-to-tls conn))
-    (setf (mysql-wire-conn-sequence-id conn) (if tls 2 1))
-    (mysql-wire--send-packet conn
-                        (mysql-wire--build-handshake-response conn password salt auth-plugin))
-    (mysql-wire--handle-auth-response conn password salt auth-plugin)))
+      (setf (mysql-conn-sequence-id conn) 1)
+      (mysql--send-packet conn (mysql--build-ssl-request conn))
+      (mysql--upgrade-to-tls conn))
+    (setf (mysql-conn-sequence-id conn) (if tls 2 1))
+    (mysql--send-packet conn
+                        (mysql--build-handshake-response conn password salt auth-plugin))
+    (mysql--handle-auth-response conn password salt auth-plugin)))
 
-(defun mysql-wire--wait-for-connect (proc host port connect-timeout)
+(defun mysql--wait-for-connect (proc host port connect-timeout)
   "Wait for PROC to connect to HOST:PORT within CONNECT-TIMEOUT seconds."
   (let ((deadline (and connect-timeout
                        (+ (float-time) connect-timeout))))
@@ -798,7 +798,7 @@ PASSWORD is the plaintext password; TLS non-nil means upgrade to TLS first."
                          0.05)))
         (when (and deadline (<= remaining 0))
           (delete-process proc)
-          (signal 'mysql-wire-connection-error
+          (signal 'mysql-connection-error
                   (list (format "Timed out connecting to %s:%s" host port))))
         ;; Poll in short slices.  Some Emacs/network stacks do not wake
         ;; `accept-process-output' promptly on connect state transitions,
@@ -808,14 +808,14 @@ PASSWORD is the plaintext password; TLS non-nil means upgrade to TLS first."
                                         (min 0.05 (max 0.0 remaining))
                                       0.05))))
     (unless (memq (process-status proc) '(open run))
-      (signal 'mysql-wire-connection-error
+      (signal 'mysql-connection-error
               (list (format "Failed to connect to %s:%s" host port))))))
 
-(defun mysql-wire--open-connection (host port &optional connect-timeout)
+(defun mysql--open-connection (host port &optional connect-timeout)
   "Open a raw TCP connection to HOST:PORT for MySQL.
 CONNECT-TIMEOUT, when non-nil, limits the initial socket connect.
 Returns (PROCESS . BUFFER)."
-  (let ((buf (generate-new-buffer " *mysql-wire-input*")))
+  (let ((buf (generate-new-buffer " *mysql-input*")))
     (with-current-buffer buf
       (set-buffer-multibyte nil))
     (let ((proc (make-network-process :name "mysql"
@@ -830,14 +830,14 @@ Returns (PROCESS . BUFFER)."
                             (with-current-buffer buf
                               (goto-char (point-max))
                               (insert data))))
-      (mysql-wire--wait-for-connect proc host port connect-timeout)
+      (mysql--wait-for-connect proc host port connect-timeout)
       (cons proc buf))))
 
-(cl-defun mysql-wire-connect (&key (host "127.0.0.1") (port 3306) user password
+(cl-defun mysql-connect (&key (host "127.0.0.1") (port 3306) user password
                                 database (tls nil tls-specified-p) ssl-mode
                                 (read-idle-timeout 30) (connect-timeout 10))
   "Connect to a MySQL server and authenticate.
-Returns a `mysql-wire-conn' struct on success.
+Returns a `mysql-conn' struct on success.
 
 HOST defaults to \"127.0.0.1\", PORT defaults to 3306.
 USER, PASSWORD, and DATABASE are strings (DATABASE is optional).
@@ -849,35 +849,35 @@ with `:ssl-mode disabled' signals an error.
 READ-IDLE-TIMEOUT limits query I/O stalls.  CONNECT-TIMEOUT limits the initial
 TCP connection wait."
   (unless user
-    (signal 'mysql-wire-connection-error (list "No user specified")))
-  (let* ((tls-mode (mysql-wire--requested-tls-mode tls tls-specified-p ssl-mode))
+    (signal 'mysql-connection-error (list "No user specified")))
+  (let* ((tls-mode (mysql--requested-tls-mode tls tls-specified-p ssl-mode))
          (tls (eq tls-mode 'required))
-         (ssl-mode (mysql-wire--normalize-ssl-mode ssl-mode)))
-    (when (and tls (not (mysql-wire--tls-available-p)))
-    (signal 'mysql-wire-connection-error (list "TLS requested but GnuTLS is not available")))
-    (pcase-let ((`(,proc . ,buf) (mysql-wire--open-connection host port connect-timeout)))
-      (let ((conn (make-mysql-wire-conn :process proc :buf buf
+         (ssl-mode (mysql--normalize-ssl-mode ssl-mode)))
+    (when (and tls (not (mysql--tls-available-p)))
+    (signal 'mysql-connection-error (list "TLS requested but GnuTLS is not available")))
+    (pcase-let ((`(,proc . ,buf) (mysql--open-connection host port connect-timeout)))
+      (let ((conn (make-mysql-conn :process proc :buf buf
                                    :host host :port port
                                    :user user :database database
                                    :read-idle-timeout read-idle-timeout)))
         (condition-case err
             (progn
-              (mysql-wire--authenticate conn password tls)
+              (mysql--authenticate conn password tls)
               conn)
-          (mysql-wire-auth-error
-           (mysql-wire--cleanup-connection-resources proc buf)
-           (if (mysql-wire--retry-auth-with-tls-p err tls-mode)
-               (mysql-wire-connect :host host :port port
+          (mysql-auth-error
+           (mysql--cleanup-connection-resources proc buf)
+           (if (mysql--retry-auth-with-tls-p err tls-mode)
+               (mysql-connect :host host :port port
                               :user user :password password
                               :database database :tls t :ssl-mode ssl-mode
                               :read-idle-timeout read-idle-timeout
                               :connect-timeout connect-timeout)
              (signal (car err) (cdr err))))
           (error
-           (mysql-wire--cleanup-connection-resources proc buf)
+           (mysql--cleanup-connection-resources proc buf)
            (signal (car err) (cdr err))))))))
 
-(defun mysql-wire--handle-auth-switch (conn password packet)
+(defun mysql--handle-auth-switch (conn password packet)
   "Handle an AUTH_SWITCH_REQUEST in PACKET for CONN.
 Resend PASSWORD with the new plugin and continue authentication."
   (let* ((pos 1)
@@ -887,83 +887,83 @@ Resend PASSWORD with the new plugin and continue authentication."
                               (if (= (aref packet (1- (length packet))) 0)
                                   (1- (length packet))
                                 (length packet))))
-         (new-auth (mysql-wire--compute-auth-response password new-salt new-plugin)))
-    (mysql-wire--send-packet conn new-auth)
-    (mysql-wire--handle-auth-response conn password new-salt new-plugin)))
+         (new-auth (mysql--compute-auth-response password new-salt new-plugin)))
+    (mysql--send-packet conn new-auth)
+    (mysql--handle-auth-response conn password new-salt new-plugin)))
 
-(defun mysql-wire--handle-auth-more-data (conn password salt auth-plugin packet)
+(defun mysql--handle-auth-more-data (conn password salt auth-plugin packet)
   "Handle caching_sha2_password AuthMoreData in PACKET for CONN.
 Dispatches on fast-auth success vs full-auth requirement for PASSWORD
 using SALT and AUTH-PLUGIN."
   (pcase (aref packet 1)
     (#x03
      ;; Fast auth success -- read the OK packet that follows
-     (let ((ok-packet (mysql-wire--read-packet conn)))
-       (pcase (mysql-wire--packet-type ok-packet)
+     (let ((ok-packet (mysql--read-packet conn)))
+       (pcase (mysql--packet-type ok-packet)
          ('ok
-          (let ((ok-info (mysql-wire--parse-ok-packet ok-packet)))
-            (setf (mysql-wire-conn-status-flags conn) (plist-get ok-info :status-flags))))
+          (let ((ok-info (mysql--parse-ok-packet ok-packet)))
+            (setf (mysql-conn-status-flags conn) (plist-get ok-info :status-flags))))
          ('err
-          (let ((err-info (mysql-wire--parse-err-packet ok-packet)))
-            (signal 'mysql-wire-auth-error
+          (let ((err-info (mysql--parse-err-packet ok-packet)))
+            (signal 'mysql-auth-error
                     (list (format "Auth failed after fast-auth: [%d] %s"
                                   (plist-get err-info :code)
                                   (plist-get err-info :message)))))))))
     (#x04
      ;; Full authentication required
-     (if (mysql-wire-conn-tls conn)
+     (if (mysql-conn-tls conn)
          (let ((cleartext (concat (encode-coding-string (or password "") 'utf-8)
                                   (unibyte-string 0))))
-           (mysql-wire--send-packet conn cleartext)
-           (mysql-wire--handle-auth-response conn password salt auth-plugin))
-       (signal 'mysql-wire-auth-error
+           (mysql--send-packet conn cleartext)
+           (mysql--handle-auth-response conn password salt auth-plugin))
+       (signal 'mysql-auth-error
                (list "caching_sha2_password full authentication requires TLS"))))))
 
-(defun mysql-wire--handle-auth-response (conn password salt auth-plugin)
+(defun mysql--handle-auth-response (conn password salt auth-plugin)
   "Handle the authentication response from the server.
 CONN is the connection, PASSWORD is the plaintext password,
 SALT is the nonce, AUTH-PLUGIN is the current auth plugin name."
   (let ((packet (condition-case _err
-                    (mysql-wire--read-packet conn)
-                  (mysql-wire-connection-error
-                   (signal 'mysql-wire-auth-error
+                    (mysql--read-packet conn)
+                  (mysql-connection-error
+                   (signal 'mysql-auth-error
                            (list "Connection closed during authentication"))))))
-    ;; Dispatch on first byte directly (not mysql-wire--packet-type, because
+    ;; Dispatch on first byte directly (not mysql--packet-type, because
     ;; AUTH_SWITCH_REQUEST 0xFE can exceed 9 bytes).
     (pcase (aref packet 0)
       (#x00
-       (let ((ok-info (mysql-wire--parse-ok-packet packet)))
-         (setf (mysql-wire-conn-status-flags conn) (plist-get ok-info :status-flags))))
+       (let ((ok-info (mysql--parse-ok-packet packet)))
+         (setf (mysql-conn-status-flags conn) (plist-get ok-info :status-flags))))
       (#xff
-       (let ((err-info (mysql-wire--parse-err-packet packet)))
-         (signal 'mysql-wire-auth-error
+       (let ((err-info (mysql--parse-err-packet packet)))
+         (signal 'mysql-auth-error
                  (list (format "Authentication failed: [%d] %s"
                                (plist-get err-info :code)
                                (plist-get err-info :message))))))
       (#xfe
-       (mysql-wire--handle-auth-switch conn password packet))
+       (mysql--handle-auth-switch conn password packet))
       (#x01
        (when (> (length packet) 1)
-         (mysql-wire--handle-auth-more-data conn password salt auth-plugin packet))))))
+         (mysql--handle-auth-more-data conn password salt auth-plugin packet))))))
 
 ;;;; Query execution
 
-(defun mysql-wire--handle-query-response (conn packet)
-  "Dispatch on PACKET type and return a `mysql-wire-result' for CONN."
-  (pcase (mysql-wire--packet-type packet)
+(defun mysql--handle-query-response (conn packet)
+  "Dispatch on PACKET type and return a `mysql-result' for CONN."
+  (pcase (mysql--packet-type packet)
     ('ok
-     (let ((ok-info (mysql-wire--parse-ok-packet packet)))
-       (setf (mysql-wire-conn-status-flags conn)
+     (let ((ok-info (mysql--parse-ok-packet packet)))
+       (setf (mysql-conn-status-flags conn)
              (plist-get ok-info :status-flags))
-       (make-mysql-wire-result
+       (make-mysql-result
         :connection conn
         :status "OK"
         :affected-rows (plist-get ok-info :affected-rows)
         :last-insert-id (plist-get ok-info :last-insert-id)
         :warnings (plist-get ok-info :warnings))))
     ('err
-     (let ((err-info (mysql-wire--parse-err-packet packet)))
-       (signal 'mysql-wire-query-error
+     (let ((err-info (mysql--parse-err-packet packet)))
+       (signal 'mysql-query-error
                (list (format "[%d] %s%s"
                              (plist-get err-info :code)
                              (if (plist-get err-info :state)
@@ -972,75 +972,75 @@ SALT is the nonce, AUTH-PLUGIN is the current auth plugin name."
                              (plist-get err-info :message))))))
     (_
      ;; Result set: first byte is column_count (lenenc int)
-     (mysql-wire--read-result-set conn packet))))
+     (mysql--read-result-set conn packet))))
 
-(defun mysql-wire-query (conn sql)
-  "Execute SQL query on CONN and return a `mysql-wire-result'.
+(defun mysql-query (conn sql)
+  "Execute SQL query on CONN and return a `mysql-result'.
 SQL is a string containing the query to execute.
-Signals `mysql-wire-error' if the connection is busy (re-entrant call)."
-  (when (mysql-wire-conn-busy conn)
-    (signal 'mysql-wire-error
+Signals `mysql-error' if the connection is busy (re-entrant call)."
+  (when (mysql-conn-busy conn)
+    (signal 'mysql-error
             (list "Connection busy — cannot send query while another is in progress")))
   ;; Flush any stale data left from previously interrupted queries.
-  (with-current-buffer (mysql-wire-conn-buf conn)
+  (with-current-buffer (mysql-conn-buf conn)
     (erase-buffer)
-    (setf (mysql-wire-conn-read-offset conn) 0))
-  (setf (mysql-wire-conn-busy conn) t)
+    (setf (mysql-conn-read-offset conn) 0))
+  (setf (mysql-conn-busy conn) t)
   (unwind-protect
       ;; Bind throw-on-input to nil so that `while-no-input' (used by
       ;; completion frameworks like corfu/company) cannot abort us
       ;; mid-response, which would leave partial data in the buffer and
       ;; corrupt subsequent queries.
       (let ((throw-on-input nil))
-        (setf (mysql-wire-conn-sequence-id conn) 0)
-        (mysql-wire--send-packet conn (concat (unibyte-string #x03)
+        (setf (mysql-conn-sequence-id conn) 0)
+        (mysql--send-packet conn (concat (unibyte-string #x03)
                                          (encode-coding-string sql 'utf-8)))
-        (mysql-wire--handle-query-response conn (mysql-wire--read-packet conn)))
-    (setf (mysql-wire-conn-busy conn) nil)))
+        (mysql--handle-query-response conn (mysql--read-packet conn)))
+    (setf (mysql-conn-busy conn) nil)))
 
-(defun mysql-wire--read-column-definitions (conn col-count)
+(defun mysql--read-column-definitions (conn col-count)
   "Read COL-COUNT column definition packets from CONN.
 Returns a list of column plists.  Also consumes the EOF packet."
   (let ((columns (cl-loop repeat col-count
-                          collect (mysql-wire--parse-column-definition
-                                   (mysql-wire--read-packet conn)))))
+                          collect (mysql--parse-column-definition
+                                   (mysql--read-packet conn)))))
     ;; Read EOF after columns (unless CLIENT_DEPRECATE_EOF)
-    (when (zerop (logand (mysql-wire-conn-capability-flags conn)
-                        mysql-wire--cap-deprecate-eof))
-      (let ((eof-packet (mysql-wire--read-packet conn)))
-        (unless (eq (mysql-wire--packet-type eof-packet) 'eof)
-          (signal 'mysql-wire-protocol-error
+    (when (zerop (logand (mysql-conn-capability-flags conn)
+                        mysql--cap-deprecate-eof))
+      (let ((eof-packet (mysql--read-packet conn)))
+        (unless (eq (mysql--packet-type eof-packet) 'eof)
+          (signal 'mysql-protocol-error
                   (list "Missing EOF packet after column definitions")))))
     columns))
 
-(defun mysql-wire--read-text-rows (conn col-count columns)
+(defun mysql--read-text-rows (conn col-count columns)
   "Read text protocol rows from CONN until EOF.
 COL-COUNT and COLUMNS guide parsing.  Returns rows in order."
   (let ((rows nil))
     (cl-loop
-     (let ((row-packet (mysql-wire--read-packet conn)))
-       (pcase (mysql-wire--packet-type row-packet)
+     (let ((row-packet (mysql--read-packet conn)))
+       (pcase (mysql--packet-type row-packet)
          ((or 'eof 'ok) (cl-return nil))
          ('err
-          (let ((err-info (mysql-wire--parse-err-packet row-packet)))
-            (signal 'mysql-wire-query-error
+          (let ((err-info (mysql--parse-err-packet row-packet)))
+            (signal 'mysql-query-error
                     (list (format "[%d] %s"
                                   (plist-get err-info :code)
                                   (plist-get err-info :message))))))
-         (_ (push (mysql-wire--convert-row
-                   (mysql-wire--parse-result-row row-packet col-count) columns)
+         (_ (push (mysql--convert-row
+                   (mysql--parse-result-row row-packet col-count) columns)
                   rows)))))
     (nreverse rows)))
 
-(defun mysql-wire--read-result-set (conn first-packet)
+(defun mysql--read-result-set (conn first-packet)
   "Read a full result set from CONN.
-FIRST-PACKET contains the column-count.  Returns a `mysql-wire-result'."
+FIRST-PACKET contains the column-count.  Returns a `mysql-result'."
   (let* ((col-count (let ((b (aref first-packet 0)))
                       (if (< b #xfb) b
-                        (car (mysql-wire--read-lenenc-int-from-string first-packet 0)))))
-         (columns (mysql-wire--read-column-definitions conn col-count))
-         (rows (mysql-wire--read-text-rows conn col-count columns)))
-    (make-mysql-wire-result
+                        (car (mysql--read-lenenc-int-from-string first-packet 0)))))
+         (columns (mysql--read-column-definitions conn col-count))
+         (rows (mysql--read-text-rows conn col-count columns)))
+    (make-mysql-result
      :connection conn
      :status "OK"
      :columns columns
@@ -1048,66 +1048,66 @@ FIRST-PACKET contains the column-count.  Returns a `mysql-wire-result'."
 
 ;;;; Disconnect
 
-(defun mysql-wire-disconnect (conn)
+(defun mysql-disconnect (conn)
   "Disconnect from MySQL server, sending COM_QUIT.
-CONN is a `mysql-wire-conn' returned by `mysql-wire-connect'."
+CONN is a `mysql-conn' returned by `mysql-connect'."
   (when conn
     (condition-case nil
-        (when (process-live-p (mysql-wire-conn-process conn))
+        (when (process-live-p (mysql-conn-process conn))
           ;; Send COM_QUIT
-          (setf (mysql-wire-conn-sequence-id conn) 0)
-          (mysql-wire--send-packet conn (unibyte-string #x01)))
+          (setf (mysql-conn-sequence-id conn) 0)
+          (mysql--send-packet conn (unibyte-string #x01)))
       (error nil))
-    (when (process-live-p (mysql-wire-conn-process conn))
-      (delete-process (mysql-wire-conn-process conn)))
-    (when (buffer-live-p (mysql-wire-conn-buf conn))
-      (kill-buffer (mysql-wire-conn-buf conn)))))
+    (when (process-live-p (mysql-conn-process conn))
+      (delete-process (mysql-conn-process conn)))
+    (when (buffer-live-p (mysql-conn-buf conn))
+      (kill-buffer (mysql-conn-buf conn)))))
 
 ;;;; Prepared statements
 
-(cl-defstruct mysql-wire-stmt
+(cl-defstruct mysql-stmt
   "A MySQL prepared statement."
   conn id param-count column-count param-definitions column-definitions)
 
-(defun mysql-wire--read-definition-packets (conn count)
+(defun mysql--read-definition-packets (conn count)
   "Read COUNT column-definition packets from CONN, then consume the EOF.
 Returns a list of parsed definitions, or nil when COUNT is 0."
   (when (> count 0)
     (prog1 (cl-loop repeat count
-                    collect (mysql-wire--parse-column-definition
-                             (mysql-wire--read-packet conn)))
-      (mysql-wire--read-packet conn)))) ;; EOF after definitions
+                    collect (mysql--parse-column-definition
+                             (mysql--read-packet conn)))
+      (mysql--read-packet conn)))) ;; EOF after definitions
 
-(defun mysql-wire--parse-prepare-ok (conn packet)
+(defun mysql--parse-prepare-ok (conn packet)
   "Parse a COM_STMT_PREPARE_OK response from PACKET.
 Reads param and column definition packets from CONN.
-Returns a `mysql-wire-stmt'."
+Returns a `mysql-stmt'."
   (unless (= (aref packet 0) #x00)
-    (signal 'mysql-wire-stmt-error (list "Non-OK status in PREPARE response")))
+    (signal 'mysql-stmt-error (list "Non-OK status in PREPARE response")))
   (let* ((stmt-id     (logior (aref packet 1) (ash (aref packet 2) 8)
                               (ash (aref packet 3) 16) (ash (aref packet 4) 24)))
          (num-columns (logior (aref packet 5) (ash (aref packet 6) 8)))
          (num-params  (logior (aref packet 7) (ash (aref packet 8) 8)))
-         (param-defs  (mysql-wire--read-definition-packets conn num-params))
-         (col-defs    (mysql-wire--read-definition-packets conn num-columns)))
-    (make-mysql-wire-stmt :conn conn
+         (param-defs  (mysql--read-definition-packets conn num-params))
+         (col-defs    (mysql--read-definition-packets conn num-columns)))
+    (make-mysql-stmt :conn conn
                      :id stmt-id
                      :param-count num-params
                      :column-count num-columns
                      :param-definitions param-defs
                      :column-definitions col-defs)))
 
-(defun mysql-wire--elisp-to-wire-type (value)
+(defun mysql--elisp-to-wire-type (value)
   "Map Elisp VALUE to a 2-byte MySQL type code (little-endian).
 Returns a cons (TYPE-CODE . UNSIGNED-FLAG)."
   (cond
-   ((null value) (cons mysql-wire-type-null 0))
-   ((integerp value) (cons mysql-wire-type-longlong 0))
-   ((floatp value) (cons mysql-wire-type-var-string 0))
-   ((stringp value) (cons mysql-wire-type-var-string 0))
-   (t (cons mysql-wire-type-var-string 0))))
+   ((null value) (cons mysql-type-null 0))
+   ((integerp value) (cons mysql-type-longlong 0))
+   ((floatp value) (cons mysql-type-var-string 0))
+   ((stringp value) (cons mysql-type-var-string 0))
+   (t (cons mysql-type-var-string 0))))
 
-(defun mysql-wire--encode-binary-value (value)
+(defun mysql--encode-binary-value (value)
   "Encode VALUE for a binary protocol parameter.
 Integers are encoded as 8-byte LE; others as lenenc strings."
   (cond
@@ -1120,15 +1120,15 @@ Integers are encoded as 8-byte LE; others as lenenc strings."
       bytes))
    ((floatp value)
     (let ((s (number-to-string value)))
-      (concat (mysql-wire--lenenc-int-bytes (length s)) s)))
+      (concat (mysql--lenenc-int-bytes (length s)) s)))
    ((stringp value)
     (let ((encoded (encode-coding-string value 'utf-8)))
-      (concat (mysql-wire--lenenc-int-bytes (length encoded)) encoded)))
+      (concat (mysql--lenenc-int-bytes (length encoded)) encoded)))
    (t
     (let ((s (format "%s" value)))
-      (concat (mysql-wire--lenenc-int-bytes (length s)) s)))))
+      (concat (mysql--lenenc-int-bytes (length s)) s)))))
 
-(defun mysql-wire--build-null-bitmap (params param-count)
+(defun mysql--build-null-bitmap (params param-count)
   "Return a NULL-bitmap string for PARAMS (length PARAM-COUNT).
 Each bit is set for a NULL parameter."
   (let* ((bitmap-len (/ (+ param-count 7) 8))
@@ -1141,115 +1141,115 @@ Each bit is set for a NULL parameter."
                 (logior (aref bitmap byte-idx) (ash 1 bit-idx))))))
     bitmap))
 
-(defun mysql-wire--build-execute-packet (stmt params)
+(defun mysql--build-execute-packet (stmt params)
   "Build a COM_STMT_EXECUTE packet for STMT with PARAMS."
-  (let* ((stmt-id     (mysql-wire-stmt-id stmt))
-         (param-count (mysql-wire-stmt-param-count stmt))
+  (let* ((stmt-id     (mysql-stmt-id stmt))
+         (param-count (mysql-stmt-param-count stmt))
          (parts nil))
     (push (unibyte-string #x17) parts)            ;; command byte
-    (push (mysql-wire--int-le-bytes stmt-id 4) parts)  ;; stmt_id: 4 bytes LE
+    (push (mysql--int-le-bytes stmt-id 4) parts)  ;; stmt_id: 4 bytes LE
     (push (unibyte-string #x00) parts)            ;; flags: no cursor
-    (push (mysql-wire--int-le-bytes 1 4) parts)        ;; iteration_count: always 1
+    (push (mysql--int-le-bytes 1 4) parts)        ;; iteration_count: always 1
     (when (> param-count 0)
-      (push (mysql-wire--build-null-bitmap params param-count) parts)
+      (push (mysql--build-null-bitmap params param-count) parts)
       (push (unibyte-string #x01) parts) ;; new_params_bound_flag
       (dotimes (i param-count) ;; type array: 2 bytes per param
-        (let ((type-info (mysql-wire--elisp-to-wire-type (nth i params))))
+        (let ((type-info (mysql--elisp-to-wire-type (nth i params))))
           (push (unibyte-string (car type-info) (cdr type-info)) parts)))
       (dotimes (i param-count) ;; values (non-NULL only)
         (unless (null (nth i params))
-          (push (mysql-wire--encode-binary-value (nth i params)) parts))))
+          (push (mysql--encode-binary-value (nth i params)) parts))))
     (apply #'concat (nreverse parts))))
 
-(defun mysql-wire-prepare (conn sql)
-  "Prepare SQL statement on CONN.  Returns a `mysql-wire-stmt'."
-  (setf (mysql-wire-conn-sequence-id conn) 0)
-  (mysql-wire--send-packet conn (concat (unibyte-string #x16)
+(defun mysql-prepare (conn sql)
+  "Prepare SQL statement on CONN.  Returns a `mysql-stmt'."
+  (setf (mysql-conn-sequence-id conn) 0)
+  (mysql--send-packet conn (concat (unibyte-string #x16)
                                    (encode-coding-string sql 'utf-8)))
-  (let ((packet (mysql-wire--read-packet conn)))
-    (pcase (mysql-wire--packet-type packet)
+  (let ((packet (mysql--read-packet conn)))
+    (pcase (mysql--packet-type packet)
       ('err
-       (let ((err-info (mysql-wire--parse-err-packet packet)))
-         (signal 'mysql-wire-stmt-error
+       (let ((err-info (mysql--parse-err-packet packet)))
+         (signal 'mysql-stmt-error
                  (list (format "[%d] %s"
                                (plist-get err-info :code)
                                (plist-get err-info :message))))))
-      (_ (mysql-wire--parse-prepare-ok conn packet)))))
+      (_ (mysql--parse-prepare-ok conn packet)))))
 
-(defun mysql-wire-execute (stmt &rest params)
-  "Execute prepared STMT with PARAMS.  Returns a `mysql-wire-result'."
-  (let ((conn (mysql-wire-stmt-conn stmt)))
-    (unless (= (length params) (mysql-wire-stmt-param-count stmt))
-      (signal 'mysql-wire-stmt-error
+(defun mysql-execute (stmt &rest params)
+  "Execute prepared STMT with PARAMS.  Returns a `mysql-result'."
+  (let ((conn (mysql-stmt-conn stmt)))
+    (unless (= (length params) (mysql-stmt-param-count stmt))
+      (signal 'mysql-stmt-error
               (list (format "Expected %d params, got %d"
-                            (mysql-wire-stmt-param-count stmt) (length params)))))
-    (setf (mysql-wire-conn-sequence-id conn) 0)
-    (mysql-wire--send-packet conn (mysql-wire--build-execute-packet stmt params))
-    (let ((packet (mysql-wire--read-packet conn)))
-      (pcase (mysql-wire--packet-type packet)
+                            (mysql-stmt-param-count stmt) (length params)))))
+    (setf (mysql-conn-sequence-id conn) 0)
+    (mysql--send-packet conn (mysql--build-execute-packet stmt params))
+    (let ((packet (mysql--read-packet conn)))
+      (pcase (mysql--packet-type packet)
         ('ok
-         (let ((ok-info (mysql-wire--parse-ok-packet packet)))
-           (setf (mysql-wire-conn-status-flags conn) (plist-get ok-info :status-flags))
-           (make-mysql-wire-result
+         (let ((ok-info (mysql--parse-ok-packet packet)))
+           (setf (mysql-conn-status-flags conn) (plist-get ok-info :status-flags))
+           (make-mysql-result
             :connection conn
             :status "OK"
             :affected-rows (plist-get ok-info :affected-rows)
             :last-insert-id (plist-get ok-info :last-insert-id)
             :warnings (plist-get ok-info :warnings))))
         ('err
-         (let ((err-info (mysql-wire--parse-err-packet packet)))
-           (signal 'mysql-wire-stmt-error
+         (let ((err-info (mysql--parse-err-packet packet)))
+           (signal 'mysql-stmt-error
                    (list (format "[%d] %s"
                                  (plist-get err-info :code)
                                  (plist-get err-info :message))))))
         (_
          ;; Binary result set
-         (mysql-wire--read-binary-result-set conn packet))))))
+         (mysql--read-binary-result-set conn packet))))))
 
-(defun mysql-wire-stmt-close (stmt)
+(defun mysql-stmt-close (stmt)
   "Close prepared STMT.  No server response is expected."
-  (let ((conn (mysql-wire-stmt-conn stmt)))
-    (setf (mysql-wire-conn-sequence-id conn) 0)
-    (mysql-wire--send-packet conn (concat (unibyte-string #x19)
-                                     (mysql-wire--int-le-bytes (mysql-wire-stmt-id stmt) 4)))))
+  (let ((conn (mysql-stmt-conn stmt)))
+    (setf (mysql-conn-sequence-id conn) 0)
+    (mysql--send-packet conn (concat (unibyte-string #x19)
+                                     (mysql--int-le-bytes (mysql-stmt-id stmt) 4)))))
 
 ;; Binary result set reading
 
-(defun mysql-wire--read-binary-rows (conn columns)
+(defun mysql--read-binary-rows (conn columns)
   "Read binary row packets from CONN until EOF, returning rows in order.
 COLUMNS is the column-definition list.
-Binary rows start with 0x00 so we cannot use `mysql-wire--packet-type';
+Binary rows start with 0x00 so we cannot use `mysql--packet-type';
 the result set ends with an EOF packet (0xFE, ≤9 bytes)."
   (let (rows)
     (cl-loop
-     (let ((row-packet (mysql-wire--read-packet conn)))
+     (let ((row-packet (mysql--read-packet conn)))
        (cond
         ((and (= (aref row-packet 0) #xfe) (<= (length row-packet) 9))
          (cl-return (nreverse rows)))
         ((= (aref row-packet 0) #xff)
-         (let ((err-info (mysql-wire--parse-err-packet row-packet)))
-           (signal 'mysql-wire-stmt-error
+         (let ((err-info (mysql--parse-err-packet row-packet)))
+           (signal 'mysql-stmt-error
                    (list (format "[%d] %s"
                                  (plist-get err-info :code)
                                  (plist-get err-info :message))))))
         (t
-         (push (mysql-wire--parse-binary-row row-packet columns) rows)))))))
+         (push (mysql--parse-binary-row row-packet columns) rows)))))))
 
-(defun mysql-wire--read-binary-result-set (conn first-packet)
+(defun mysql--read-binary-result-set (conn first-packet)
   "Read a binary protocol result set from CONN.
-FIRST-PACKET contains the column count.  Returns a `mysql-wire-result'."
+FIRST-PACKET contains the column count.  Returns a `mysql-result'."
   (let* ((col-count (aref first-packet 0))
          (columns   (cl-loop repeat col-count
-                             collect (mysql-wire--parse-column-definition
-                                      (mysql-wire--read-packet conn)))))
-    (mysql-wire--read-packet conn) ;; EOF after column definitions
-    (make-mysql-wire-result
+                             collect (mysql--parse-column-definition
+                                      (mysql--read-packet conn)))))
+    (mysql--read-packet conn) ;; EOF after column definitions
+    (make-mysql-result
      :connection conn
      :status "OK"
      :columns columns
-     :rows (mysql-wire--read-binary-rows conn columns))))
+     :rows (mysql--read-binary-rows conn columns))))
 
-(defun mysql-wire--binary-null-p (null-bitmap col-index)
+(defun mysql--binary-null-p (null-bitmap col-index)
   "Check if column COL-INDEX is NULL in NULL-BITMAP.
 Binary row NULL bitmap has a 2-bit offset."
   (let* ((offset (+ col-index 2))
@@ -1257,7 +1257,7 @@ Binary row NULL bitmap has a 2-bit offset."
          (bit-idx (% offset 8)))
     (not (zerop (logand (aref null-bitmap byte-idx) (ash 1 bit-idx))))))
 
-(defun mysql-wire--parse-binary-row (packet columns)
+(defun mysql--parse-binary-row (packet columns)
   "Parse a binary protocol row from PACKET using COLUMNS metadata."
   ;; First byte is 0x00 (packet header for binary rows)
   (let* ((col-count (length columns))
@@ -1266,48 +1266,48 @@ Binary row NULL bitmap has a 2-bit offset."
          (pos (+ 1 bitmap-len))
          (row nil))
     (dotimes (i col-count)
-      (if (mysql-wire--binary-null-p null-bitmap i)
+      (if (mysql--binary-null-p null-bitmap i)
           (push nil row)
-        (pcase-let ((`(,val . ,new-pos) (mysql-wire--decode-binary-value packet pos
+        (pcase-let ((`(,val . ,new-pos) (mysql--decode-binary-value packet pos
                                                                     (plist-get (nth i columns) :type))))
           (push val row)
           (setq pos new-pos))))
     (nreverse row)))
 
-(defun mysql-wire--decode-binary-lenenc-string (packet pos)
+(defun mysql--decode-binary-lenenc-string (packet pos)
   "Decode a length-encoded string from PACKET at POS.
 Returns (string . new-pos)."
-  (pcase-let ((`(,len . ,start) (mysql-wire--read-lenenc-int-from-string packet pos)))
+  (pcase-let ((`(,len . ,start) (mysql--read-lenenc-int-from-string packet pos)))
     (cons (substring packet start (+ start len)) (+ start len))))
 
-(defun mysql-wire--decode-binary-value (packet pos type)
+(defun mysql--decode-binary-value (packet pos type)
   "Decode a binary value from PACKET at POS for the given TYPE.
 Returns (value . new-pos)."
   (pcase type
-    ((pred (= mysql-wire-type-tiny))
+    ((pred (= mysql-type-tiny))
      (cons (aref packet pos) (1+ pos)))
-    ((or (pred (= mysql-wire-type-short)) (pred (= mysql-wire-type-year)))
-     (cons (mysql-wire--read-le-uint packet pos 2) (+ pos 2)))
-    ((or (pred (= mysql-wire-type-long)) (pred (= mysql-wire-type-int24)))
-     (cons (mysql-wire--read-le-uint packet pos 4) (+ pos 4)))
-    ((pred (= mysql-wire-type-longlong))
-     (cons (mysql-wire--read-le-uint packet pos 8) (+ pos 8)))
-    ((pred (= mysql-wire-type-float))
-     (cons (mysql-wire--ieee754-single-to-float packet pos) (+ pos 4)))
-    ((pred (= mysql-wire-type-double))
-     (cons (mysql-wire--ieee754-double-to-float packet pos) (+ pos 8)))
-    ((or (pred (= mysql-wire-type-date))
-         (pred (= mysql-wire-type-datetime))
-         (pred (= mysql-wire-type-timestamp)))
-     (mysql-wire--decode-binary-datetime packet pos type))
-    ((pred (= mysql-wire-type-time))
-     (mysql-wire--decode-binary-time packet pos))
-    ((pred (= mysql-wire-type-null))
+    ((or (pred (= mysql-type-short)) (pred (= mysql-type-year)))
+     (cons (mysql--read-le-uint packet pos 2) (+ pos 2)))
+    ((or (pred (= mysql-type-long)) (pred (= mysql-type-int24)))
+     (cons (mysql--read-le-uint packet pos 4) (+ pos 4)))
+    ((pred (= mysql-type-longlong))
+     (cons (mysql--read-le-uint packet pos 8) (+ pos 8)))
+    ((pred (= mysql-type-float))
+     (cons (mysql--ieee754-single-to-float packet pos) (+ pos 4)))
+    ((pred (= mysql-type-double))
+     (cons (mysql--ieee754-double-to-float packet pos) (+ pos 8)))
+    ((or (pred (= mysql-type-date))
+         (pred (= mysql-type-datetime))
+         (pred (= mysql-type-timestamp)))
+     (mysql--decode-binary-datetime packet pos type))
+    ((pred (= mysql-type-time))
+     (mysql--decode-binary-time packet pos))
+    ((pred (= mysql-type-null))
      (cons nil pos))
     (_
-     (mysql-wire--decode-binary-lenenc-string packet pos))))
+     (mysql--decode-binary-lenenc-string packet pos))))
 
-(defun mysql-wire--ieee754-single-to-float (data offset)
+(defun mysql--ieee754-single-to-float (data offset)
   "Decode a 4-byte IEEE 754 single-precision float from DATA at OFFSET."
   (let* ((b0 (aref data offset))
          (b1 (aref data (+ offset 1)))
@@ -1326,7 +1326,7 @@ Returns (value . new-pos)."
      (t
       (* sign (ldexp (+ 1.0 (/ (float mantissa) #x800000)) (- exponent 127)))))))
 
-(defun mysql-wire--ieee754-double-to-float (data offset)
+(defun mysql--ieee754-double-to-float (data offset)
   "Decode an 8-byte IEEE 754 double-precision float from DATA at OFFSET."
   (let* ((b0 (aref data offset))
          (b1 (aref data (+ offset 1)))
@@ -1360,7 +1360,7 @@ Returns (value . new-pos)."
      (t
       (* sign (ldexp (+ 1.0 (/ mantissa 4503599627370496.0)) (- exponent 1023)))))))
 
-(defun mysql-wire--decode-binary-datetime (packet pos type)
+(defun mysql--decode-binary-datetime (packet pos type)
   "Decode a binary DATE/DATETIME/TIMESTAMP of TYPE from PACKET at POS.
 Returns (value . new-pos)."
   (let ((len (aref packet pos)))
@@ -1371,7 +1371,7 @@ Returns (value . new-pos)."
        (let ((year (logior (aref packet pos) (ash (aref packet (+ pos 1)) 8)))
              (month (aref packet (+ pos 2)))
              (day (aref packet (+ pos 3))))
-         (cons (if (= type mysql-wire-type-date)
+         (cons (if (= type mysql-type-date)
                    (list :year year :month month :day day)
                  (list :year year :month month :day day
                        :hours 0 :minutes 0 :seconds 0))
@@ -1388,7 +1388,7 @@ Returns (value . new-pos)."
                (+ pos len))))
       (_ (cons nil (+ pos len))))))
 
-(defun mysql-wire--decode-binary-time (packet pos)
+(defun mysql--decode-binary-time (packet pos)
   "Decode a binary TIME value from PACKET at POS.
 Returns (value . new-pos)."
   (let ((len (aref packet pos)))
@@ -1413,53 +1413,53 @@ Returns (value . new-pos)."
 
 ;;;; Convenience APIs
 
-(defmacro with-mysql-wire-connection (var connect-args &rest body)
+(defmacro with-mysql-connection (var connect-args &rest body)
   "Execute BODY with VAR bound to a MySQL connection.
-CONNECT-ARGS is a plist passed to `mysql-wire-connect'.
+CONNECT-ARGS is a plist passed to `mysql-connect'.
 The connection is automatically closed when BODY exits."
   (declare (indent 2))
-  `(let ((,var (mysql-wire-connect ,@connect-args)))
+  `(let ((,var (mysql-connect ,@connect-args)))
      (unwind-protect
          (progn ,@body)
-       (mysql-wire-disconnect ,var))))
+       (mysql-disconnect ,var))))
 
-(defmacro with-mysql-wire-transaction (conn &rest body)
+(defmacro with-mysql-transaction (conn &rest body)
   "Execute BODY inside a SQL transaction on CONN.
 Issues BEGIN before BODY.  If BODY completes normally, issues COMMIT.
 If BODY signals an error, issues ROLLBACK before re-raising."
   (declare (indent 1))
   (let ((c (make-symbol "conn")))
     `(let ((,c ,conn))
-       (mysql-wire-query ,c "BEGIN")
+       (mysql-query ,c "BEGIN")
        (condition-case err
            (prog1 (progn ,@body)
-             (mysql-wire-query ,c "COMMIT"))
+             (mysql-query ,c "COMMIT"))
          (error
-          (mysql-wire-query ,c "ROLLBACK")
+          (mysql-query ,c "ROLLBACK")
           (signal (car err) (cdr err)))))))
 
-(defun mysql-wire-ping (conn)
+(defun mysql-ping (conn)
   "Send COM_PING to the MySQL server via CONN.
 Returns t if the server is alive, or signals an error."
-  (setf (mysql-wire-conn-sequence-id conn) 0)
-  (mysql-wire--send-packet conn (unibyte-string #x0e))
-  (let ((packet (mysql-wire--read-packet conn)))
-    (pcase (mysql-wire--packet-type packet)
+  (setf (mysql-conn-sequence-id conn) 0)
+  (mysql--send-packet conn (unibyte-string #x0e))
+  (let ((packet (mysql--read-packet conn)))
+    (pcase (mysql--packet-type packet)
       ('ok t)
       ('err
-       (let ((err-info (mysql-wire--parse-err-packet packet)))
-         (signal 'mysql-wire-error
+       (let ((err-info (mysql--parse-err-packet packet)))
+         (signal 'mysql-error
                  (list (format "Ping failed: [%d] %s"
                                (plist-get err-info :code)
                                (plist-get err-info :message))))))
-      (_ (signal 'mysql-wire-protocol-error (list "Unexpected response to COM_PING"))))))
+      (_ (signal 'mysql-protocol-error (list "Unexpected response to COM_PING"))))))
 
-(defun mysql-wire-escape-identifier (name)
+(defun mysql-escape-identifier (name)
   "Escape NAME for use as a MySQL identifier.
 Wraps in backticks and doubles any embedded backticks."
   (concat "`" (replace-regexp-in-string "`" "``" name) "`"))
 
-(defun mysql-wire-escape-literal (value)
+(defun mysql-escape-literal (value)
   "Escape VALUE for use as a MySQL string literal.
 Wraps in single quotes and escapes special characters."
   (concat "'"
@@ -1478,22 +1478,22 @@ Wraps in single quotes and escapes special characters."
            value nil t)
           "'"))
 
-(defun mysql-wire-connect-uri (uri)
+(defun mysql-connect-uri (uri)
   "Connect to MySQL using a URI string.
 URI format: mysql://user:password@host:port/database"
   (unless (string-match
            "\\`mysql://\\([^:@]*\\)\\(?::\\([^@]*\\)\\)?@\\([^:/]*\\)\\(?::\\([0-9]+\\)\\)?\\(?:/\\(.*\\)\\)?\\'"
            uri)
-    (signal 'mysql-wire-connection-error (list (format "Invalid MySQL URI: %s" uri))))
+    (signal 'mysql-connection-error (list (format "Invalid MySQL URI: %s" uri))))
   (let ((user (match-string 1 uri))
         (password (match-string 2 uri))
         (host (match-string 3 uri))
         (port (if-let* ((p (match-string 4 uri))) (string-to-number p) 3306))
         (database (match-string 5 uri)))
-    (mysql-wire-connect :host host :port port :user user
+    (mysql-connect :host host :port port :user user
                    :password password
                    :database (if (or (null database) (string-empty-p database))
                                  nil database))))
 
-(provide 'mysql-wire)
-;;; mysql-wire.el ends here
+(provide 'mysql)
+;;; mysql.el ends here

@@ -1,4 +1,4 @@
-#+title: mysql-wire
+#+title: mysql
 
 A pure Emacs Lisp MySQL wire protocol client.  It speaks the
 classic MySQL protocol directly and does not shell out to the =mysql= CLI.
@@ -16,22 +16,22 @@ classic MySQL protocol directly and does not shell out to the =mysql= CLI.
 * Usage
 
 #+begin_src emacs-lisp
-(require 'mysql-wire)
+(require 'mysql)
 
-(let* ((conn (mysql-wire-connect :host "127.0.0.1"
+(let* ((conn (mysql-connect :host "127.0.0.1"
                                  :port 3306
                                  :user "root"
                                  :password "secret"
                                  :database "mydb"))
-       (result (mysql-wire-query conn "SELECT 1 AS n")))
+       (result (mysql-query conn "SELECT 1 AS n")))
   (unwind-protect
-      (message "Rows: %S" (mysql-wire-result-rows result))
-    (mysql-wire-disconnect conn)))
+      (message "Rows: %S" (mysql-result-rows result))
+    (mysql-disconnect conn)))
 #+end_src
 
 * Installation
 
-Once submitted, install =mysql-wire= from MELPA.
+Once submitted, install =mysql= from MELPA.
 
 * License
 
