@@ -905,5 +905,4 @@ Skips unless both `mysql-test-password' and
               (mysql-query-error nil))
           (mysql-disconnect admin))))))
 
-(provide 'mysql-test)
 ;;; mysql-test.el ends here
