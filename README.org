@@ -11,6 +11,8 @@ classic MySQL protocol directly and does not shell out to the =mysql= CLI.
 - Authentication with =sha256_password=
 - Prepared statements
 - Transactions
+- Public transaction helpers: =mysql-autocommit-p=, =mysql-in-transaction-p=,
+  =mysql-set-autocommit=, =mysql-commit=, and =mysql-rollback=
 - Support for MySQL 5.6+, MySQL 8.x, and MariaDB 10.11+
 
 * Usage
@@ -27,6 +29,18 @@ classic MySQL protocol directly and does not shell out to the =mysql= CLI.
   (unwind-protect
       (message "Rows: %S" (mysql-result-rows result))
     (mysql-disconnect conn)))
+#+end_src
+
+Transaction helpers are available when you want explicit control over the
+session state:
+
+#+begin_src emacs-lisp
+(mysql-set-autocommit conn nil)
+(unwind-protect
+    (progn
+      (mysql-query conn "INSERT INTO demo(name) VALUES ('alice')")
+      (mysql-commit conn))
+  (mysql-set-autocommit conn t))
 #+end_src
 
 * Installation

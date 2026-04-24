@@ -4,7 +4,7 @@
 
 ;; Author: Lucius Chen <chenyh572@gmail.com>
 ;; Maintainer: Lucius Chen <chenyh572@gmail.com>
-;; Version: 0.1.0
+;; Version: 0.2.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: comm, data
 ;; URL: https://github.com/LuciusChen/mysql.el
@@ -72,6 +72,14 @@
 (defconst mysql--cap-plugin-auth          #x00080000)
 (defconst mysql--cap-plugin-auth-lenenc   #x00200000)
 (defconst mysql--cap-deprecate-eof        #x01000000)
+
+;;;; Server status flags
+
+(defconst mysql--server-status-in-transaction #x0001
+  "MySQL server status flag: a transaction is active.")
+
+(defconst mysql--server-status-autocommit #x0002
+  "MySQL server status flag: autocommit mode is enabled.")
 
 ;;;; TLS configuration
 
@@ -231,20 +239,6 @@ Advances read-offset without deleting buffer content."
      ((= first #xfe) (mysql--read-int-le conn 8))
      (t (signal 'mysql-protocol-error
                 (list (format "Invalid lenenc-int prefix: 0x%02x" first)))))))
-
-(defun mysql--read-string-nul (conn)
-  "Read a NUL-terminated string from CONN."
-  (let ((chars nil))
-    (cl-loop for b = (mysql--read-byte conn)
-             until (= b 0)
-             do (push b chars))
-    (apply #'unibyte-string (nreverse chars))))
-
-(defun mysql--read-string-lenenc (conn)
-  "Read a length-encoded string from CONN."
-  (let ((len (mysql--read-lenenc-int conn)))
-    (if (zerop len) ""
-      (mysql--read-bytes conn len))))
 
 ;;;; Packet I/O
 
@@ -516,10 +510,6 @@ Returns a plist with :code, :state, :message."
       (cl-incf pos 5))
     (setq message (decode-coding-string (substring packet pos) 'utf-8))
     (list :code code :state state :message message)))
-
-(defun mysql--parse-eof-packet (_packet)
-  "Parse an EOF_Packet.  Returns t."
-  t)
 
 (defun mysql--packet-type (packet)
   "Determine the type of PACKET from its first byte.
@@ -1435,8 +1425,38 @@ If BODY signals an error, issues ROLLBACK before re-raising."
            (prog1 (progn ,@body)
              (mysql-query ,c "COMMIT"))
          (error
-          (mysql-query ,c "ROLLBACK")
+         (mysql-query ,c "ROLLBACK")
           (signal (car err) (cdr err)))))))
+
+(defun mysql-autocommit-p (conn)
+  "Return non-nil when MySQL CONN has autocommit enabled.
+When CONN has not yet observed any server status flags, default to
+assuming autocommit mode."
+  (let ((flags (mysql-conn-status-flags conn)))
+    (if (integerp flags)
+        (not (zerop (logand flags mysql--server-status-autocommit)))
+      t)))
+
+(defun mysql-in-transaction-p (conn)
+  "Return non-nil when MySQL CONN is inside a transaction."
+  (let ((flags (mysql-conn-status-flags conn)))
+    (and (integerp flags)
+         (not (zerop (logand flags mysql--server-status-in-transaction))))))
+
+(defun mysql-set-autocommit (conn enabled)
+  "Set MySQL CONN autocommit mode to ENABLED.
+ENABLED non-nil turns autocommit on; nil turns it off."
+  (mysql-query conn
+               (format "SET autocommit = %d"
+                       (if enabled 1 0))))
+
+(defun mysql-commit (conn)
+  "Commit the current transaction on MySQL CONN."
+  (mysql-query conn "COMMIT"))
+
+(defun mysql-rollback (conn)
+  "Roll back the current transaction on MySQL CONN."
+  (mysql-query conn "ROLLBACK"))
 
 (defun mysql-ping (conn)
   "Send COM_PING to the MySQL server via CONN.

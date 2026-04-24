@@ -226,6 +226,47 @@
            "mysql://root:pass@localhost/mydb"))
   (should (null (match-string 4 "mysql://root:pass@localhost/mydb"))))
 
+(ert-deftest mysql-test-transaction-state-helpers ()
+  "Test autocommit and transaction status helpers."
+  (let ((conn (make-mysql-conn :status-flags
+                               (logior mysql--server-status-autocommit
+                                       mysql--server-status-in-transaction))))
+    (should (mysql-autocommit-p conn))
+    (should (mysql-in-transaction-p conn)))
+  (let ((conn (make-mysql-conn :status-flags mysql--server-status-in-transaction)))
+    (should-not (mysql-autocommit-p conn))
+    (should (mysql-in-transaction-p conn)))
+  (let ((conn (make-mysql-conn)))
+    (should (mysql-autocommit-p conn))
+    (should-not (mysql-in-transaction-p conn))))
+
+(ert-deftest mysql-test-set-autocommit-issues-sql ()
+  "Test that `mysql-set-autocommit' sends the expected SQL."
+  (let ((conn (make-mysql-conn))
+        (queries nil))
+    (cl-letf (((symbol-function 'mysql-query)
+               (lambda (_conn sql)
+                 (push sql queries)
+                 (make-mysql-result :status "OK"))))
+      (mysql-set-autocommit conn nil)
+      (mysql-set-autocommit conn t))
+    (should (equal (nreverse queries)
+                   '("SET autocommit = 0"
+                     "SET autocommit = 1")))))
+
+(ert-deftest mysql-test-commit-and-rollback-issue-sql ()
+  "Test that `mysql-commit' and `mysql-rollback' send the expected SQL."
+  (let ((conn (make-mysql-conn))
+        (queries nil))
+    (cl-letf (((symbol-function 'mysql-query)
+               (lambda (_conn sql)
+                 (push sql queries)
+                 (make-mysql-result :status "OK"))))
+      (mysql-commit conn)
+      (mysql-rollback conn))
+    (should (equal (nreverse queries)
+                   '("COMMIT" "ROLLBACK")))))
+
 ;;;; TLS unit tests
 
 (ert-deftest mysql-test-ssl-request-packet ()
@@ -722,6 +763,26 @@ Skips if `mysql-test-password' is nil."
         (error "Intentional error")))
     (let ((result (mysql-query conn "SELECT COUNT(*) FROM _mysql_el_tx2")))
       (should (= (car (car (mysql-result-rows result))) 0)))))
+
+(ert-deftest mysql-test-live-autocommit-toggle ()
+  :tags '(:mysql-live)
+  "Test session autocommit toggling and transaction state helpers."
+  (mysql-test--with-conn conn
+    (mysql-query conn "CREATE TEMPORARY TABLE _mysql_el_toggle (id INT)")
+    (should (mysql-autocommit-p conn))
+    (mysql-set-autocommit conn nil)
+    (should-not (mysql-autocommit-p conn))
+    (should-not (mysql-in-transaction-p conn))
+    (mysql-query conn "INSERT INTO _mysql_el_toggle VALUES (1)")
+    (should (mysql-in-transaction-p conn))
+    (mysql-rollback conn)
+    (should-not (mysql-in-transaction-p conn))
+    (should-not (mysql-autocommit-p conn))
+    (let ((result (mysql-query conn "SELECT COUNT(*) FROM _mysql_el_toggle")))
+      (should (= (car (car (mysql-result-rows result))) 0)))
+    (mysql-set-autocommit conn t)
+    (should (mysql-autocommit-p conn))
+    (should-not (mysql-in-transaction-p conn))))
 
 (ert-deftest mysql-test-live-ping ()
   :tags '(:mysql-live)
