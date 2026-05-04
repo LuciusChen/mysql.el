@@ -36,6 +36,35 @@
 (defvar mysql-test-tls-enabled nil
   "Set this to enable TLS live tests.")
 
+(defconst mysql-test--unsupported-caps
+  '((compress . #x00000020)
+    (local-files . #x00000080)
+    (multi-statements . #x00010000)
+    (multi-results . #x00020000)
+    (ps-multi-results . #x00040000)
+    (connect-attrs . #x00100000)
+    (plugin-auth-lenenc-data . #x00200000)
+    (session-track . #x00800000)
+    (deprecate-eof . #x01000000)
+    (optional-resultset-metadata . #x02000000)
+    (zstd-compression . #x04000000)
+    (query-attributes . #x08000000)
+    (multi-factor-authentication . #x10000000))
+  "MySQL capability flags that the protocol client does not implement.")
+
+(defun mysql-test--packet-client-flags (packet)
+  "Return the 4-byte client capability flags from PACKET."
+  (logior (aref packet 0)
+          (ash (aref packet 1) 8)
+          (ash (aref packet 2) 16)
+          (ash (aref packet 3) 24)))
+
+(defun mysql-test--assert-no-unsupported-caps (flags)
+  "Assert FLAGS do not advertise unsupported MySQL protocol features."
+  (dolist (cap mysql-test--unsupported-caps)
+    (ert-info ((format "capability: %s" (car cap)))
+      (should (zerop (logand flags (cdr cap)))))))
+
 ;;;; Unit tests — protocol helpers (no server needed)
 
 (ert-deftest mysql-test-int-le-bytes ()
@@ -267,6 +296,23 @@
     (should (equal (nreverse queries)
                    '("COMMIT" "ROLLBACK")))))
 
+(ert-deftest mysql-test-client-capability-flags ()
+  "Client flags should match implemented protocol paths."
+  (let* ((conn (make-mysql-conn :host "localhost"
+                                :port 3306
+                                :user "root"
+                                :database "test"
+                                :tls t))
+         (flags (mysql--client-capabilities conn)))
+    (should (not (zerop (logand flags mysql--cap-long-password))))
+    (should (not (zerop (logand flags mysql--cap-protocol-41))))
+    (should (not (zerop (logand flags mysql--cap-transactions))))
+    (should (not (zerop (logand flags mysql--cap-secure-connection))))
+    (should (not (zerop (logand flags mysql--cap-plugin-auth))))
+    (should (not (zerop (logand flags mysql--cap-ssl))))
+    (should (not (zerop (logand flags mysql--cap-connect-with-db))))
+    (mysql-test--assert-no-unsupported-caps flags)))
+
 ;;;; TLS unit tests
 
 (ert-deftest mysql-test-ssl-request-packet ()
@@ -277,12 +323,10 @@
     ;; SSL_REQUEST is exactly 32 bytes
     (should (= (length packet) 32))
     ;; Check client flags include SSL capability
-    (let ((flags (logior (aref packet 0)
-                         (ash (aref packet 1) 8)
-                         (ash (aref packet 2) 16)
-                         (ash (aref packet 3) 24))))
+    (let ((flags (mysql-test--packet-client-flags packet)))
       (should (not (zerop (logand flags mysql--cap-ssl))))
-      (should (not (zerop (logand flags mysql--cap-protocol-41)))))
+      (should (not (zerop (logand flags mysql--cap-protocol-41))))
+      (mysql-test--assert-no-unsupported-caps flags))
     ;; Character set byte should be 45 (utf8mb4)
     (should (= (aref packet 8) 45))
     ;; Bytes 9-31 should be zero (filler)
