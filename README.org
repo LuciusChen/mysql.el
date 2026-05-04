@@ -1,5 +1,7 @@
 #+title: mysql
 
+[[https://melpa.org/#/mysql][file:https://melpa.org/packages/mysql-badge.svg]]
+
 A pure Emacs Lisp MySQL wire protocol client.  It speaks the
 classic MySQL protocol directly and does not shell out to the =mysql= CLI.
 
@@ -45,7 +47,11 @@ session state:
 
 * Installation
 
-Once submitted, install =mysql= from MELPA.
+Install =mysql= from MELPA:
+
+#+begin_src emacs-lisp
+(package-install 'mysql)
+#+end_src
 
 * License
 
