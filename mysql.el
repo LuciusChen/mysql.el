@@ -996,7 +996,7 @@ SALT is the nonce, AUTH-PLUGIN is the current auth plugin name."
 (defun mysql-query (conn sql)
   "Execute SQL query on CONN and return a `mysql-result'.
 SQL is a string containing the query to execute.
-Signals `mysql-error' if the connection is busy (re-entrant call)."
+Signals `mysql-error' if CONN is busy with another command."
   (mysql--run-command-response
    conn "query"
    (lambda ()
@@ -1169,7 +1169,8 @@ Each bit is set for a NULL parameter."
     (apply #'concat (nreverse parts))))
 
 (defun mysql-prepare (conn sql)
-  "Prepare SQL statement on CONN.  Returns a `mysql-stmt'."
+  "Prepare SQL statement on CONN and return a `mysql-stmt'.
+Signals `mysql-error' if CONN is busy with another command."
   (mysql--run-command-response
    conn "prepared statement"
    (lambda ()
@@ -1187,7 +1188,8 @@ Each bit is set for a NULL parameter."
          (_ (mysql--parse-prepare-ok conn packet)))))))
 
 (defun mysql-execute (stmt &rest params)
-  "Execute prepared STMT with PARAMS.  Returns a `mysql-result'."
+  "Execute prepared STMT with PARAMS and return a `mysql-result'.
+Signals `mysql-error' if STMT's connection is busy with another command."
   (let ((conn (mysql-stmt-conn stmt)))
     (unless (= (length params) (mysql-stmt-param-count stmt))
       (signal 'mysql-stmt-error
@@ -1483,7 +1485,8 @@ ENABLED non-nil turns autocommit on; nil turns it off."
 
 (defun mysql-ping (conn)
   "Send COM_PING to the MySQL server via CONN.
-Returns t if the server is alive, or signals an error."
+Returns t if the server is alive, or signals an error.
+Signals `mysql-error' if CONN is busy with another command."
   (mysql--run-command-response
    conn "ping"
    (lambda ()
