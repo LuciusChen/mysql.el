@@ -175,6 +175,35 @@ also accepted."
   last-insert-id
   warnings)
 
+;;;; Command response guard
+
+(defun mysql--clear-input-buffer (conn)
+  "Discard unread input bytes buffered on CONN."
+  (when-let* ((buf (mysql-conn-buf conn))
+              ((buffer-live-p buf)))
+    (with-current-buffer buf
+      (erase-buffer)
+      (setf (mysql-conn-read-offset conn) 0))))
+
+(defun mysql--run-command-response (conn command-name fn)
+  "Run FN as an exclusive response-reading command on CONN.
+COMMAND-NAME is used in the busy-connection error message."
+  (when (mysql-conn-busy conn)
+    (signal 'mysql-error
+            (list (format "Connection busy — cannot send %s while another command is in progress"
+                          command-name))))
+  ;; Flush any stale data left from a previously interrupted command.
+  (mysql--clear-input-buffer conn)
+  (setf (mysql-conn-busy conn) t)
+  (unwind-protect
+      ;; Bind throw-on-input to nil so that `while-no-input' (used by
+      ;; completion frameworks like corfu/company) cannot abort us
+      ;; mid-response, which would leave partial data in the buffer and
+      ;; corrupt subsequent commands.
+      (let ((throw-on-input nil))
+        (funcall fn))
+    (setf (mysql-conn-busy conn) nil)))
+
 ;;;; Low-level I/O primitives
 
 (defun mysql--ensure-data (conn n)
@@ -968,25 +997,13 @@ SALT is the nonce, AUTH-PLUGIN is the current auth plugin name."
   "Execute SQL query on CONN and return a `mysql-result'.
 SQL is a string containing the query to execute.
 Signals `mysql-error' if the connection is busy (re-entrant call)."
-  (when (mysql-conn-busy conn)
-    (signal 'mysql-error
-            (list "Connection busy — cannot send query while another is in progress")))
-  ;; Flush any stale data left from previously interrupted queries.
-  (with-current-buffer (mysql-conn-buf conn)
-    (erase-buffer)
-    (setf (mysql-conn-read-offset conn) 0))
-  (setf (mysql-conn-busy conn) t)
-  (unwind-protect
-      ;; Bind throw-on-input to nil so that `while-no-input' (used by
-      ;; completion frameworks like corfu/company) cannot abort us
-      ;; mid-response, which would leave partial data in the buffer and
-      ;; corrupt subsequent queries.
-      (let ((throw-on-input nil))
-        (setf (mysql-conn-sequence-id conn) 0)
-        (mysql--send-packet conn (concat (unibyte-string #x03)
-                                         (encode-coding-string sql 'utf-8)))
-        (mysql--handle-query-response conn (mysql--read-packet conn)))
-    (setf (mysql-conn-busy conn) nil)))
+  (mysql--run-command-response
+   conn "query"
+   (lambda ()
+     (setf (mysql-conn-sequence-id conn) 0)
+     (mysql--send-packet conn (concat (unibyte-string #x03)
+                                      (encode-coding-string sql 'utf-8)))
+     (mysql--handle-query-response conn (mysql--read-packet conn)))))
 
 (defun mysql--read-column-definitions (conn col-count)
   "Read COL-COUNT column definition packets from CONN.
@@ -1153,18 +1170,21 @@ Each bit is set for a NULL parameter."
 
 (defun mysql-prepare (conn sql)
   "Prepare SQL statement on CONN.  Returns a `mysql-stmt'."
-  (setf (mysql-conn-sequence-id conn) 0)
-  (mysql--send-packet conn (concat (unibyte-string #x16)
-                                   (encode-coding-string sql 'utf-8)))
-  (let ((packet (mysql--read-packet conn)))
-    (pcase (mysql--packet-type packet)
-      ('err
-       (let ((err-info (mysql--parse-err-packet packet)))
-         (signal 'mysql-stmt-error
-                 (list (format "[%d] %s"
-                               (plist-get err-info :code)
-                               (plist-get err-info :message))))))
-      (_ (mysql--parse-prepare-ok conn packet)))))
+  (mysql--run-command-response
+   conn "prepared statement"
+   (lambda ()
+     (setf (mysql-conn-sequence-id conn) 0)
+     (mysql--send-packet conn (concat (unibyte-string #x16)
+                                      (encode-coding-string sql 'utf-8)))
+     (let ((packet (mysql--read-packet conn)))
+       (pcase (mysql--packet-type packet)
+         ('err
+          (let ((err-info (mysql--parse-err-packet packet)))
+            (signal 'mysql-stmt-error
+                    (list (format "[%d] %s"
+                                  (plist-get err-info :code)
+                                  (plist-get err-info :message))))))
+         (_ (mysql--parse-prepare-ok conn packet)))))))
 
 (defun mysql-execute (stmt &rest params)
   "Execute prepared STMT with PARAMS.  Returns a `mysql-result'."
@@ -1173,28 +1193,31 @@ Each bit is set for a NULL parameter."
       (signal 'mysql-stmt-error
               (list (format "Expected %d params, got %d"
                             (mysql-stmt-param-count stmt) (length params)))))
-    (setf (mysql-conn-sequence-id conn) 0)
-    (mysql--send-packet conn (mysql--build-execute-packet stmt params))
-    (let ((packet (mysql--read-packet conn)))
-      (pcase (mysql--packet-type packet)
-        ('ok
-         (let ((ok-info (mysql--parse-ok-packet packet)))
-           (setf (mysql-conn-status-flags conn) (plist-get ok-info :status-flags))
-           (make-mysql-result
-            :connection conn
-            :status "OK"
-            :affected-rows (plist-get ok-info :affected-rows)
-            :last-insert-id (plist-get ok-info :last-insert-id)
-            :warnings (plist-get ok-info :warnings))))
-        ('err
-         (let ((err-info (mysql--parse-err-packet packet)))
-           (signal 'mysql-stmt-error
-                   (list (format "[%d] %s"
-                                 (plist-get err-info :code)
-                                 (plist-get err-info :message))))))
-        (_
-         ;; Binary result set
-         (mysql--read-binary-result-set conn packet))))))
+    (mysql--run-command-response
+     conn "prepared statement execution"
+     (lambda ()
+       (setf (mysql-conn-sequence-id conn) 0)
+       (mysql--send-packet conn (mysql--build-execute-packet stmt params))
+       (let ((packet (mysql--read-packet conn)))
+         (pcase (mysql--packet-type packet)
+           ('ok
+            (let ((ok-info (mysql--parse-ok-packet packet)))
+              (setf (mysql-conn-status-flags conn) (plist-get ok-info :status-flags))
+              (make-mysql-result
+               :connection conn
+               :status "OK"
+               :affected-rows (plist-get ok-info :affected-rows)
+               :last-insert-id (plist-get ok-info :last-insert-id)
+               :warnings (plist-get ok-info :warnings))))
+           ('err
+            (let ((err-info (mysql--parse-err-packet packet)))
+              (signal 'mysql-stmt-error
+                      (list (format "[%d] %s"
+                                    (plist-get err-info :code)
+                                    (plist-get err-info :message))))))
+           (_
+            ;; Binary result set
+            (mysql--read-binary-result-set conn packet))))))))
 
 (defun mysql-stmt-close (stmt)
   "Close prepared STMT.  No server response is expected."
@@ -1461,18 +1484,22 @@ ENABLED non-nil turns autocommit on; nil turns it off."
 (defun mysql-ping (conn)
   "Send COM_PING to the MySQL server via CONN.
 Returns t if the server is alive, or signals an error."
-  (setf (mysql-conn-sequence-id conn) 0)
-  (mysql--send-packet conn (unibyte-string #x0e))
-  (let ((packet (mysql--read-packet conn)))
-    (pcase (mysql--packet-type packet)
-      ('ok t)
-      ('err
-       (let ((err-info (mysql--parse-err-packet packet)))
-         (signal 'mysql-error
-                 (list (format "Ping failed: [%d] %s"
-                               (plist-get err-info :code)
-                               (plist-get err-info :message))))))
-      (_ (signal 'mysql-protocol-error (list "Unexpected response to COM_PING"))))))
+  (mysql--run-command-response
+   conn "ping"
+   (lambda ()
+     (setf (mysql-conn-sequence-id conn) 0)
+     (mysql--send-packet conn (unibyte-string #x0e))
+     (let ((packet (mysql--read-packet conn)))
+       (pcase (mysql--packet-type packet)
+         ('ok t)
+         ('err
+          (let ((err-info (mysql--parse-err-packet packet)))
+            (signal 'mysql-error
+                    (list (format "Ping failed: [%d] %s"
+                                  (plist-get err-info :code)
+                                  (plist-get err-info :message))))))
+         (_ (signal 'mysql-protocol-error
+                    (list "Unexpected response to COM_PING"))))))))
 
 (defun mysql-escape-identifier (name)
   "Escape NAME for use as a MySQL identifier.

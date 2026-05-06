@@ -365,6 +365,64 @@
     ;; Params: nil=bit0, 42=bit1, nil=bit2 → bitmap = 0b101 = 5
     (should (= (aref packet 10) 5))))
 
+(ert-deftest mysql-test-prepare-binds-throw-on-input-nil ()
+  "COM_STMT_PREPARE should not let `throw-on-input' interrupt packet reads."
+  (let ((conn (make-mysql-conn))
+        observed-throw-on-input)
+    (cl-letf (((symbol-function 'mysql--send-packet) #'ignore)
+              ((symbol-function 'mysql--read-packet)
+               (lambda (_conn)
+                 (setq observed-throw-on-input throw-on-input)
+                 (unibyte-string #x00 #x01 #x00 #x00 #x00
+                                 #x00 #x00 #x00 #x00
+                                 #x00 #x00 #x00))))
+      (let ((throw-on-input 'mysql-test-tag))
+        (mysql-prepare conn "SELECT 1")))
+    (should-not observed-throw-on-input)))
+
+(ert-deftest mysql-test-prepare-marks-connection-busy-during-read ()
+  "COM_STMT_PREPARE should mark CONN busy while reading its response."
+  (let ((conn (make-mysql-conn))
+        observed-busy)
+    (cl-letf (((symbol-function 'mysql--send-packet) #'ignore)
+              ((symbol-function 'mysql--read-packet)
+               (lambda (conn)
+                 (setq observed-busy (mysql-conn-busy conn))
+                 (unibyte-string #x00 #x01 #x00 #x00 #x00
+                                 #x00 #x00 #x00 #x00
+                                 #x00 #x00 #x00))))
+      (mysql-prepare conn "SELECT 1"))
+    (should observed-busy)
+    (should-not (mysql-conn-busy conn))))
+
+(ert-deftest mysql-test-execute-binds-throw-on-input-nil ()
+  "COM_STMT_EXECUTE should not let `throw-on-input' interrupt packet reads."
+  (let* ((conn (make-mysql-conn))
+         (stmt (make-mysql-stmt :conn conn :id 1 :param-count 0))
+         observed-throw-on-input)
+    (cl-letf (((symbol-function 'mysql--send-packet) #'ignore)
+              ((symbol-function 'mysql--read-packet)
+               (lambda (_conn)
+                 (setq observed-throw-on-input throw-on-input)
+                 (unibyte-string #x00 #x01 #x00 #x02 #x00 #x00 #x00))))
+      (let ((throw-on-input 'mysql-test-tag))
+        (mysql-execute stmt)))
+    (should-not observed-throw-on-input)))
+
+(ert-deftest mysql-test-execute-marks-connection-busy-during-read ()
+  "COM_STMT_EXECUTE should mark CONN busy while reading its response."
+  (let* ((conn (make-mysql-conn))
+         (stmt (make-mysql-stmt :conn conn :id 1 :param-count 0))
+         observed-busy)
+    (cl-letf (((symbol-function 'mysql--send-packet) #'ignore)
+              ((symbol-function 'mysql--read-packet)
+               (lambda (conn)
+                 (setq observed-busy (mysql-conn-busy conn))
+                 (unibyte-string #x00 #x01 #x00 #x02 #x00 #x00 #x00))))
+      (mysql-execute stmt))
+    (should observed-busy)
+    (should-not (mysql-conn-busy conn))))
+
 (ert-deftest mysql-test-elisp-to-wire-type ()
   "Test Elisp to MySQL type mapping."
   (should (= (car (mysql--elisp-to-wire-type nil)) mysql-type-null))
