@@ -4,7 +4,7 @@
 
 ;; Author: Lucius Chen <chenyh572@gmail.com>
 ;; Maintainer: Lucius Chen <chenyh572@gmail.com>
-;; Version: 0.2.0
+;; Version: 0.2.1
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: comm, data
 ;; URL: https://github.com/LuciusChen/mysql.el
@@ -1004,6 +1004,35 @@ Signals `mysql-error' if CONN is busy with another command."
      (mysql--send-packet conn (concat (unibyte-string #x03)
                                       (encode-coding-string sql 'utf-8)))
      (mysql--handle-query-response conn (mysql--read-packet conn)))))
+
+(defun mysql-drain-query-response (conn &optional read-idle-timeout)
+  "Read and discard one pending query response from CONN.
+This is useful after an out-of-band server-side cancel when a prior
+`mysql-query' was aborted before it could consume the server response.
+
+When READ-IDLE-TIMEOUT is non-nil, use it as CONN's idle read timeout
+while draining, then restore the previous timeout.
+
+Return t after a complete OK or result-set response is consumed.  If
+the pending response is a MySQL ERR packet, signal `mysql-query-error'
+after consuming that response.  Signal `mysql-error' if CONN is busy or
+if the response cannot be fully consumed."
+  (when (mysql-conn-busy conn)
+    (signal 'mysql-error
+            (list "Connection busy — cannot drain a query response while another command is in progress")))
+  (let ((old-timeout (mysql-conn-read-idle-timeout conn)))
+    (unwind-protect
+        (condition-case err
+            (progn
+              (when read-idle-timeout
+                (setf (mysql-conn-read-idle-timeout conn) read-idle-timeout))
+              (setf (mysql-conn-busy conn) t)
+              (mysql--handle-query-response conn (mysql--read-packet conn))
+              t)
+          (mysql-query-error
+           (signal (car err) (cdr err))))
+      (setf (mysql-conn-busy conn) nil)
+      (setf (mysql-conn-read-idle-timeout conn) old-timeout))))
 
 (defun mysql--read-column-definitions (conn col-count)
   "Read COL-COUNT column definition packets from CONN.

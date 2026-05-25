@@ -539,6 +539,54 @@
     (should (equal (mysql-result-status result) "OK"))
     (should (= (mysql-result-affected-rows result) 5))))
 
+(ert-deftest mysql-test-drain-query-response-restores-timeout-and-busy ()
+  "Draining a response should mark CONN busy and restore its timeout."
+  (let ((conn (make-mysql-conn :read-idle-timeout 30))
+        observed-timeout
+        observed-busy
+        observed-packet)
+    (cl-letf (((symbol-function 'mysql--read-packet)
+               (lambda (mysql-conn)
+                 (should (eq mysql-conn conn))
+                 (setq observed-timeout (mysql-conn-read-idle-timeout mysql-conn)
+                       observed-busy (mysql-conn-busy mysql-conn))
+                 "packet"))
+              ((symbol-function 'mysql--handle-query-response)
+               (lambda (mysql-conn packet)
+                 (should (eq mysql-conn conn))
+                 (setq observed-packet packet)
+                 (make-mysql-result :connection mysql-conn :status "OK"))))
+      (should (mysql-drain-query-response conn 0.25))
+      (should (equal observed-packet "packet"))
+      (should (= observed-timeout 0.25))
+      (should observed-busy)
+      (should-not (mysql-conn-busy conn))
+      (should (= (mysql-conn-read-idle-timeout conn) 30)))))
+
+(ert-deftest mysql-test-drain-query-response-propagates-query-error ()
+  "Draining should consume an ERR response but still signal `mysql-query-error'."
+  (let ((conn (make-mysql-conn :read-idle-timeout 30))
+        drained)
+    (cl-letf (((symbol-function 'mysql--read-packet)
+               (lambda (_conn) "err-packet"))
+              ((symbol-function 'mysql--handle-query-response)
+               (lambda (_conn packet)
+                 (should (equal packet "err-packet"))
+                 (setq drained t)
+                 (signal 'mysql-query-error '("[1317] Query execution was interrupted")))))
+      (should-error (mysql-drain-query-response conn 0.25)
+                    :type 'mysql-query-error)
+      (should drained)
+      (should-not (mysql-conn-busy conn))
+      (should (= (mysql-conn-read-idle-timeout conn) 30)))))
+
+(ert-deftest mysql-test-drain-query-response-rejects-busy-connection ()
+  "Draining should not run while CONN is already busy."
+  (let ((conn (make-mysql-conn :busy t)))
+    (should-error (mysql-drain-query-response conn)
+                  :type 'mysql-error)
+    (should (mysql-conn-busy conn))))
+
 (ert-deftest mysql-test-open-connection-does-not-force-plain-type ()
   "Opening a MySQL socket should not force an unsupported process type."
   (let (captured-args)

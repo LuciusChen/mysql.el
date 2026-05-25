@@ -5,6 +5,10 @@
 - Loading `mysql.el` must not alter Emacs behavior; activation must stay explicit.
 - Public symbols use the `mysql-` prefix.
 - Private symbols use the `mysql--` prefix.
+- Downstream packages must use public `mysql-` APIs only. If a client needs
+  protocol behavior that currently exists only in `mysql--*`, add a documented
+  public wrapper here and bump the package version instead of telling the client
+  to call internals.
 - Do not add any `clutch` or UI dependencies.
 - Require `cl-lib` explicitly when using `cl-*` APIs; do not rely on transitive loading.
 - Avoid `eval-when-compile` for runtime-needed dependencies.
