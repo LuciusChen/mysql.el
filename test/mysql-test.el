@@ -539,6 +539,32 @@
     (should (equal (mysql-result-status result) "OK"))
     (should (= (mysql-result-affected-rows result) 5))))
 
+(ert-deftest mysql-test-connection-state-accessors ()
+  "Test public connection state accessors."
+  (let ((conn (make-mysql-conn :host "localhost" :port 3306
+                               :user "root" :database "test"
+                               :connection-id 123 :busy t)))
+    (should-not (mysql-live-p conn))
+    (should (mysql-busy-p conn))
+    (should (= (mysql-connection-id conn) 123))
+    (should (equal (mysql-connection-user conn) "root"))
+    (should (equal (mysql-connection-host conn) "localhost"))
+    (should (= (mysql-connection-port conn) 3306))
+    (should (equal (mysql-current-database conn) "test"))))
+
+(ert-deftest mysql-test-select-database-updates-cache-after-use ()
+  "Test `mysql-select-database' updates CONN after a successful USE."
+  (let ((conn (make-mysql-conn :database "old"))
+        observed-sql)
+    (cl-letf (((symbol-function 'mysql-query)
+               (lambda (mysql-conn sql)
+                 (should (eq mysql-conn conn))
+                 (setq observed-sql sql)
+                 (make-mysql-result :connection mysql-conn :status "OK"))))
+      (should (equal (mysql-select-database conn " app`db ") "app`db"))
+      (should (equal observed-sql "USE `app``db`"))
+      (should (equal (mysql-current-database conn) "app`db")))))
+
 (ert-deftest mysql-test-drain-query-response-restores-timeout-and-busy ()
   "Draining a response should mark CONN busy and restore its timeout."
   (let ((conn (make-mysql-conn :read-idle-timeout 30))

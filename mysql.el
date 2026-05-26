@@ -4,7 +4,7 @@
 
 ;; Author: Lucius Chen <chenyh572@gmail.com>
 ;; Maintainer: Lucius Chen <chenyh572@gmail.com>
-;; Version: 0.2.1
+;; Version: 0.2.2
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: comm, data
 ;; URL: https://github.com/LuciusChen/mysql.el
@@ -46,6 +46,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'subr-x)
 
 (declare-function gnutls-negotiate "gnutls" (&rest _spec))
 
@@ -174,6 +175,38 @@ also accepted."
   affected-rows
   last-insert-id
   warnings)
+
+;;;; Connection state accessors
+
+(defun mysql-live-p (conn)
+  "Return non-nil if MySQL CONN's network process is live."
+  (and (mysql-conn-p conn)
+       (processp (mysql-conn-process conn))
+       (process-live-p (mysql-conn-process conn))))
+
+(defun mysql-busy-p (conn)
+  "Return non-nil if MySQL CONN is running a command."
+  (mysql-conn-busy conn))
+
+(defun mysql-connection-id (conn)
+  "Return the MySQL server connection id for CONN."
+  (mysql-conn-connection-id conn))
+
+(defun mysql-connection-user (conn)
+  "Return the configured MySQL user for CONN."
+  (mysql-conn-user conn))
+
+(defun mysql-connection-host (conn)
+  "Return the configured MySQL host for CONN."
+  (mysql-conn-host conn))
+
+(defun mysql-connection-port (conn)
+  "Return the configured MySQL port for CONN."
+  (mysql-conn-port conn))
+
+(defun mysql-current-database (conn)
+  "Return the cached current MySQL database for CONN."
+  (mysql-conn-database conn))
 
 ;;;; Command response guard
 
@@ -1537,6 +1570,15 @@ Signals `mysql-error' if CONN is busy with another command."
   "Escape NAME for use as a MySQL identifier.
 Wraps in backticks and doubles any embedded backticks."
   (concat "`" (replace-regexp-in-string "`" "``" name) "`"))
+
+(defun mysql-select-database (conn database)
+  "Select DATABASE on MySQL CONN and return the selected name.
+DATABASE is trimmed before use.  CONN's cached current database is
+updated after the server accepts the `USE' command."
+  (let ((database (string-trim database)))
+    (mysql-query conn (format "USE %s" (mysql-escape-identifier database)))
+    (setf (mysql-conn-database conn) database)
+    database))
 
 (defun mysql-escape-literal (value)
   "Escape VALUE for use as a MySQL string literal.
