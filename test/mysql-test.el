@@ -352,7 +352,37 @@
     ;; flags: 0x00
     (should (= (aref packet 5) #x00))
     ;; iteration_count: 1
-    (should (= (aref packet 6) 1))))
+    (should (= (aref packet 6) 1))
+    ;; new_params_bound_flag: first execute sends parameter types
+    (should (= (aref packet 11) #x01))))
+
+(ert-deftest mysql-test-build-execute-packet-reuses-bound-types ()
+  "COM_STMT_EXECUTE should omit type metadata when types are unchanged."
+  (let* ((types (mysql--param-type-vector '(1 "a")))
+         (stmt (make-mysql-stmt :id 1 :param-count 2 :column-count 1
+                                :parameter-types types))
+         (packet (mysql--build-execute-packet stmt '(42 "hi") types)))
+    (should (= (aref packet 11) #x00))
+    (should (= (length packet) 23))
+    (should (= (aref packet 20) 2))
+    (should (equal (substring packet 21 23) "hi"))))
+
+(ert-deftest mysql-test-build-execute-packet-cursor-flag ()
+  "COM_STMT_EXECUTE should encode the requested cursor flag."
+  (let* ((stmt (make-mysql-stmt :id 1 :param-count 0 :column-count 1))
+         (packet (mysql--build-execute-packet
+                  stmt nil nil mysql--stmt-cursor-read-only)))
+    (should (= (aref packet 5) mysql--stmt-cursor-read-only))))
+
+(ert-deftest mysql-test-build-fetch-packet ()
+  "Test COM_STMT_FETCH packet construction."
+  (let* ((stmt (make-mysql-stmt :id #x01020304 :param-count 0))
+         (packet (mysql--build-fetch-packet stmt 25)))
+    (should (= (aref packet 0) #x1c))
+    (should (equal (substring packet 1 5)
+                   (unibyte-string #x04 #x03 #x02 #x01)))
+    (should (equal (substring packet 5 9)
+                   (mysql--int-le-bytes 25 4)))))
 
 (ert-deftest mysql-test-null-bitmap ()
   "Test NULL bitmap construction in execute packet."
@@ -364,6 +394,11 @@
     ;; NULL bitmap starts at offset 10 (1+4+1+4)
     ;; Params: nil=bit0, 42=bit1, nil=bit2 → bitmap = 0b101 = 5
     (should (= (aref packet 10) 5))))
+
+(ert-deftest mysql-test-build-null-bitmap ()
+  "Test NULL bitmap construction from a parameter vector."
+  (should (equal (mysql--build-null-bitmap [nil 42 nil] 3)
+                 (unibyte-string 5))))
 
 (ert-deftest mysql-test-prepare-binds-throw-on-input-nil ()
   "COM_STMT_PREPARE should not let `throw-on-input' interrupt packet reads."
@@ -422,6 +457,96 @@
       (mysql-execute stmt))
     (should observed-busy)
     (should-not (mysql-conn-busy conn))))
+
+(ert-deftest mysql-test-execute-caches-parameter-types ()
+  "COM_STMT_EXECUTE should rebind parameter types only when they change."
+  (let* ((conn (make-mysql-conn))
+         (stmt (make-mysql-stmt :conn conn :id 1 :param-count 2))
+         packets)
+    (cl-letf (((symbol-function 'mysql--send-packet)
+               (lambda (_conn packet)
+                 (push packet packets)))
+              ((symbol-function 'mysql--read-packet)
+               (lambda (_conn)
+                 (unibyte-string #x00 #x01 #x00 #x02 #x00 #x00 #x00))))
+      (mysql-execute stmt 1 "a")
+      (mysql-execute stmt 2 "bb"))
+    (setq packets (nreverse packets))
+    (should (= (aref (nth 0 packets) 11) #x01))
+    (should (= (aref (nth 1 packets) 11) #x00))
+    (should (equal (mysql-stmt-parameter-types stmt)
+                   (mysql--param-type-vector '(2 "bb"))))))
+
+(ert-deftest mysql-test-execute-cursor-returns-cursor ()
+  "COM_STMT_EXECUTE with cursor flag should return a cursor object."
+  (let* ((conn (make-mysql-conn))
+         (stmt (make-mysql-stmt :conn conn :id 7 :param-count 1))
+         (columns (list (list :name "id" :type mysql-type-longlong)))
+         packets)
+    (cl-letf (((symbol-function 'mysql--send-packet)
+               (lambda (_conn packet)
+                 (push packet packets)))
+              ((symbol-function 'mysql--read-packet)
+               (lambda (_conn)
+                 (unibyte-string 1)))
+              ((symbol-function 'mysql--read-column-definitions)
+               (lambda (_conn col-count)
+                 (should (= col-count 1))
+                 columns)))
+      (let ((cursor (mysql-execute-cursor stmt 42)))
+        (should (mysql-cursor-p cursor))
+        (should (eq (mysql-cursor-stmt cursor) stmt))
+        (should (eq (mysql-cursor-columns cursor) columns))))
+    (let ((packet (car packets)))
+      (should (= (aref packet 0) #x17))
+      (should (= (aref packet 5) mysql--stmt-cursor-read-only)))))
+
+(ert-deftest mysql-test-fetch-updates-cursor-exhaustion ()
+  "COM_STMT_FETCH should update cursor state from EOF status flags."
+  (let* ((conn (make-mysql-conn))
+         (stmt (make-mysql-stmt :conn conn :id 9 :param-count 0))
+         (columns (list (list :name "id" :type mysql-type-longlong)))
+         (cursor (make-mysql-cursor :stmt stmt :columns columns))
+         packets)
+    (cl-letf (((symbol-function 'mysql--send-packet)
+               (lambda (_conn packet)
+                 (push packet packets)))
+              ((symbol-function 'mysql--read-binary-rows-with-status)
+               (lambda (_conn read-columns)
+                 (should (eq read-columns columns))
+                 (list :rows '((1) (2))
+                       :warnings 0
+                       :status-flags mysql--server-status-last-row-sent))))
+      (let ((result (mysql-fetch cursor 2)))
+        (should (equal (mysql-result-rows result) '((1) (2))))
+        (should (mysql-cursor-exhausted-p cursor))
+        (should (= (mysql-result-warnings result) 0))))
+    (let ((packet (car packets)))
+      (should (= (aref packet 0) #x1c))
+      (should (equal (substring packet 1 5)
+                     (mysql--int-le-bytes 9 4)))
+      (should (equal (substring packet 5 9)
+                     (mysql--int-le-bytes 2 4))))))
+
+(ert-deftest mysql-test-cursor-close-resets-open-cursor ()
+  "Closing an open cursor should send COM_STMT_RESET."
+  (let* ((conn (make-mysql-conn))
+         (stmt (make-mysql-stmt :conn conn :id 11 :parameter-types [cached]))
+         (cursor (make-mysql-cursor :stmt stmt))
+         packets)
+    (cl-letf (((symbol-function 'mysql--send-packet)
+               (lambda (_conn packet)
+                 (push packet packets)))
+              ((symbol-function 'mysql--read-packet)
+               (lambda (_conn)
+                 (unibyte-string #x00 #x00 #x00 #x02 #x00 #x00 #x00))))
+      (should (mysql-cursor-close cursor)))
+    (should (mysql-cursor-exhausted-p cursor))
+    (should-not (mysql-stmt-parameter-types stmt))
+    (let ((packet (car packets)))
+      (should (= (aref packet 0) #x1a))
+      (should (equal (substring packet 1 5)
+                     (mysql--int-le-bytes 11 4))))))
 
 (ert-deftest mysql-test-elisp-to-wire-type ()
   "Test Elisp to MySQL type mapping."
@@ -526,6 +651,29 @@
                          (unibyte-string 3) "foo"))
          (row (mysql--parse-result-row packet 2)))
     (should (equal row '(nil "foo")))))
+
+(ert-deftest mysql-test-parse-result-row-with-type-vector ()
+  "Test text row parsing with direct type conversion."
+  (let* ((packet (concat (unibyte-string 2) "42"
+                         (unibyte-string 5) "hello"))
+         (types (vector mysql-type-long mysql-type-var-string))
+         (row (mysql--parse-result-row packet 2 types)))
+    (should (equal row '(42 "hello")))))
+
+(ert-deftest mysql-test-result-column-count ()
+  "Test result-set header column count decoding."
+  (should (= (mysql--result-column-count (unibyte-string 3)) 3))
+  (should (= (mysql--result-column-count
+              (concat (unibyte-string #xfc) (mysql--int-le-bytes 260 2)))
+             260)))
+
+(ert-deftest mysql-test-parse-eof-packet ()
+  "Test EOF packet status parsing."
+  (let ((info (mysql--parse-eof-packet
+               (unibyte-string #xfe #x02 #x00 #x80 #x00))))
+    (should (= (plist-get info :warnings) 2))
+    (should (= (plist-get info :status-flags)
+               mysql--server-status-last-row-sent))))
 
 (ert-deftest mysql-test-struct-creation ()
   "Test that structs can be created."
@@ -1022,6 +1170,28 @@ Skips if `mysql-test-password' is nil."
         (let ((result (mysql-execute stmt (1+ i))))
           (should (= (car (car (mysql-result-rows result))) (* (1+ i) 2)))))
       (mysql-stmt-close stmt))))
+
+(ert-deftest mysql-test-live-prepare-cursor-fetch ()
+  :tags '(:mysql-live)
+  "Test server-side prepared statement cursor fetch."
+  (mysql-test--with-conn conn
+    (let ((stmt (mysql-prepare conn
+                  "SELECT ? AS n UNION ALL SELECT ? AS n ORDER BY n"))
+          cursor)
+      (unwind-protect
+          (progn
+            (setq cursor (mysql-execute-cursor stmt 1 2))
+            (let ((first (mysql-fetch cursor 1)))
+              (should (equal (mysql-result-rows first) '((1))))
+              (should-not (mysql-cursor-exhausted-p cursor)))
+            (let ((second (mysql-fetch cursor 1)))
+              (should (equal (mysql-result-rows second) '((2)))))
+            (let ((done (mysql-fetch cursor 1)))
+              (should-not (mysql-result-rows done))
+              (should (mysql-cursor-exhausted-p cursor))))
+        (when cursor
+          (mysql-cursor-close cursor))
+        (mysql-stmt-close stmt)))))
 
 (ert-deftest mysql-test-live-prepare-binary-types ()
   :tags '(:mysql-live)

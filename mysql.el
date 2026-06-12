@@ -4,7 +4,7 @@
 
 ;; Author: Lucius Chen <chenyh572@gmail.com>
 ;; Maintainer: Lucius Chen <chenyh572@gmail.com>
-;; Version: 0.2.2
+;; Version: 0.2.3
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: comm, data
 ;; URL: https://github.com/LuciusChen/mysql.el
@@ -81,6 +81,9 @@
 
 (defconst mysql--server-status-autocommit #x0002
   "MySQL server status flag: autocommit mode is enabled.")
+
+(defconst mysql--server-status-last-row-sent #x0080
+  "MySQL server status flag: the final server-side cursor row was sent.")
 
 ;;;; TLS configuration
 
@@ -558,6 +561,16 @@ Returns a plist with :affected-rows, :last-insert-id, :status-flags, :warnings."
           :status-flags status-flags
           :warnings warnings)))
 
+(defun mysql--parse-eof-packet (packet)
+  "Parse an EOF_Packet from PACKET.
+Returns a plist with :warnings and :status-flags."
+  (list :warnings (when (<= 5 (length packet))
+                    (logior (aref packet 1)
+                            (ash (aref packet 2) 8)))
+        :status-flags (when (<= 5 (length packet))
+                        (logior (aref packet 3)
+                                (ash (aref packet 4) 8)))))
+
 (defun mysql--parse-err-packet (packet)
   "Parse an ERR_Packet from PACKET (first byte 0xFF already verified).
 Returns a plist with :code, :state, :message."
@@ -644,18 +657,33 @@ Returns a plist with column metadata."
 
 ;;;; Row parsing
 
-(defun mysql--parse-result-row (packet column-count)
+(defun mysql--result-column-count (packet)
+  "Return the column count encoded in result-set header PACKET."
+  (let ((first (aref packet 0)))
+    (if (< first #xfb)
+        first
+      (car (mysql--read-lenenc-int-from-string packet 0)))))
+
+(defun mysql--column-type-vector (columns)
+  "Return a vector of MySQL type codes from COLUMNS."
+  (vconcat (mapcar (lambda (column) (plist-get column :type)) columns)))
+
+(defun mysql--parse-result-row (packet column-count &optional type-vector)
   "Parse a result row from PACKET with COLUMN-COUNT columns.
-Each column value is either NULL (0xFB prefix) or a lenenc-string."
+Each column value is either NULL (0xFB prefix) or a lenenc-string.
+When TYPE-VECTOR is non-nil, convert values while parsing."
   (let ((pos 0)
         (row nil))
-    (dotimes (_ column-count)
+    (dotimes (i column-count)
       (if (= (aref packet pos) #xfb)
           (progn
             (push nil row)
             (cl-incf pos 1))
         (pcase-let ((`(,val . ,new-pos) (mysql--read-lenenc-string-from-string packet pos)))
-          (push val row)
+          (push (if type-vector
+                    (mysql--parse-value val (aref type-vector i))
+                  val)
+                row)
           (setq pos new-pos))))
     (nreverse row)))
 
@@ -741,12 +769,6 @@ or nil for zero datetimes."
   "Parse string VALUE according to MySQL column TYPE code.
 Returns the converted Elisp value, or nil for SQL NULL."
   (when value (mysql--parse-typed-value value type)))
-
-(defun mysql--convert-row (row columns)
-  "Convert ROW values according to COLUMNS type information."
-  (cl-mapcar (lambda (val col)
-               (mysql--parse-value val (plist-get col :type)))
-             row columns))
 
 ;;;; TLS support
 
@@ -1085,7 +1107,8 @@ Returns a list of column plists.  Also consumes the EOF packet."
 (defun mysql--read-text-rows (conn col-count columns)
   "Read text protocol rows from CONN until EOF.
 COL-COUNT and COLUMNS guide parsing.  Returns rows in order."
-  (let ((rows nil))
+  (let ((rows nil)
+        (type-vector (mysql--column-type-vector columns)))
     (cl-loop
      (let ((row-packet (mysql--read-packet conn)))
        (pcase (mysql--packet-type row-packet)
@@ -1096,17 +1119,14 @@ COL-COUNT and COLUMNS guide parsing.  Returns rows in order."
                     (list (format "[%d] %s"
                                   (plist-get err-info :code)
                                   (plist-get err-info :message))))))
-         (_ (push (mysql--convert-row
-                   (mysql--parse-result-row row-packet col-count) columns)
+         (_ (push (mysql--parse-result-row row-packet col-count type-vector)
                   rows)))))
     (nreverse rows)))
 
 (defun mysql--read-result-set (conn first-packet)
   "Read a full result set from CONN.
 FIRST-PACKET contains the column-count.  Returns a `mysql-result'."
-  (let* ((col-count (let ((b (aref first-packet 0)))
-                      (if (< b #xfb) b
-                        (car (mysql--read-lenenc-int-from-string first-packet 0)))))
+  (let* ((col-count (mysql--result-column-count first-packet))
          (columns (mysql--read-column-definitions conn col-count))
          (rows (mysql--read-text-rows conn col-count columns)))
     (make-mysql-result
@@ -1134,9 +1154,20 @@ CONN is a `mysql-conn' returned by `mysql-connect'."
 
 ;;;; Prepared statements
 
+(defconst mysql--stmt-cursor-none #x00
+  "COM_STMT_EXECUTE cursor flag for no server-side cursor.")
+
+(defconst mysql--stmt-cursor-read-only #x01
+  "COM_STMT_EXECUTE cursor flag for a read-only server-side cursor.")
+
 (cl-defstruct mysql-stmt
   "A MySQL prepared statement."
-  conn id param-count column-count param-definitions column-definitions)
+  conn id param-count column-count param-definitions column-definitions
+  parameter-types)
+
+(cl-defstruct mysql-cursor
+  "A MySQL server-side prepared statement cursor."
+  stmt columns exhausted-p)
 
 (defun mysql--read-definition-packets (conn count)
   "Read COUNT column-definition packets from CONN, then consume the EOF.
@@ -1176,6 +1207,10 @@ Returns a cons (TYPE-CODE . UNSIGNED-FLAG)."
    ((stringp value) (cons mysql-type-var-string 0))
    (t (cons mysql-type-var-string 0))))
 
+(defun mysql--param-type-vector (params)
+  "Return a vector of MySQL parameter type descriptors for PARAMS."
+  (vconcat (mapcar #'mysql--elisp-to-wire-type params)))
+
 (defun mysql--encode-binary-value (value)
   "Encode VALUE for a binary protocol parameter.
 Integers are encoded as 8-byte LE; others as lenenc strings."
@@ -1203,31 +1238,39 @@ Each bit is set for a NULL parameter."
   (let* ((bitmap-len (/ (+ param-count 7) 8))
          (bitmap (make-string bitmap-len 0)))
     (dotimes (i param-count)
-      (when (null (nth i params))
+      (when (null (aref params i))
         (let ((byte-idx (/ i 8))
               (bit-idx  (% i 8)))
           (aset bitmap byte-idx
                 (logior (aref bitmap byte-idx) (ash 1 bit-idx))))))
     bitmap))
 
-(defun mysql--build-execute-packet (stmt params)
-  "Build a COM_STMT_EXECUTE packet for STMT with PARAMS."
+(defun mysql--build-execute-packet (stmt params &optional type-vector cursor-flag)
+  "Build a COM_STMT_EXECUTE packet for STMT with PARAMS.
+TYPE-VECTOR is the cached parameter type descriptor vector.
+CURSOR-FLAG is the COM_STMT_EXECUTE cursor flag byte."
   (let* ((stmt-id     (mysql-stmt-id stmt))
          (param-count (mysql-stmt-param-count stmt))
+         (param-vector (vconcat params))
+         (type-vector (or type-vector (mysql--param-type-vector params)))
+         (send-types (not (equal type-vector (mysql-stmt-parameter-types stmt))))
+         (cursor-flag (or cursor-flag mysql--stmt-cursor-none))
          (parts nil))
     (push (unibyte-string #x17) parts)            ;; command byte
     (push (mysql--int-le-bytes stmt-id 4) parts)  ;; stmt_id: 4 bytes LE
-    (push (unibyte-string #x00) parts)            ;; flags: no cursor
+    (push (unibyte-string cursor-flag) parts)      ;; flags: cursor type
     (push (mysql--int-le-bytes 1 4) parts)        ;; iteration_count: always 1
     (when (> param-count 0)
-      (push (mysql--build-null-bitmap params param-count) parts)
-      (push (unibyte-string #x01) parts) ;; new_params_bound_flag
-      (dotimes (i param-count) ;; type array: 2 bytes per param
-        (let ((type-info (mysql--elisp-to-wire-type (nth i params))))
-          (push (unibyte-string (car type-info) (cdr type-info)) parts)))
+      (push (mysql--build-null-bitmap param-vector param-count) parts)
+      (push (unibyte-string (if send-types #x01 #x00)) parts)
+      (when send-types
+        (dotimes (i param-count) ;; type array: 2 bytes per param
+          (let ((type-info (aref type-vector i)))
+            (push (unibyte-string (car type-info) (cdr type-info)) parts))))
       (dotimes (i param-count) ;; values (non-NULL only)
-        (unless (null (nth i params))
-          (push (mysql--encode-binary-value (nth i params)) parts))))
+        (let ((value (aref param-vector i)))
+          (unless (null value)
+            (push (mysql--encode-binary-value value) parts)))))
     (apply #'concat (nreverse parts))))
 
 (defun mysql-prepare (conn sql)
@@ -1261,7 +1304,10 @@ Signals `mysql-error' if STMT's connection is busy with another command."
      conn "prepared statement execution"
      (lambda ()
        (setf (mysql-conn-sequence-id conn) 0)
-       (mysql--send-packet conn (mysql--build-execute-packet stmt params))
+       (let* ((type-vector (mysql--param-type-vector params))
+              (packet (mysql--build-execute-packet stmt params type-vector)))
+         (mysql--send-packet conn packet)
+         (setf (mysql-stmt-parameter-types stmt) type-vector))
        (let ((packet (mysql--read-packet conn)))
          (pcase (mysql--packet-type packet)
            ('ok
@@ -1283,6 +1329,108 @@ Signals `mysql-error' if STMT's connection is busy with another command."
             ;; Binary result set
             (mysql--read-binary-result-set conn packet))))))))
 
+(defun mysql-execute-cursor (stmt &rest params)
+  "Execute prepared STMT with PARAMS and return a `mysql-cursor'.
+The returned cursor must be consumed with `mysql-fetch' and may be
+closed early with `mysql-cursor-close'."
+  (let ((conn (mysql-stmt-conn stmt)))
+    (unless (= (length params) (mysql-stmt-param-count stmt))
+      (signal 'mysql-stmt-error
+              (list (format "Expected %d params, got %d"
+                            (mysql-stmt-param-count stmt) (length params)))))
+    (mysql--run-command-response
+     conn "prepared statement cursor execution"
+     (lambda ()
+       (setf (mysql-conn-sequence-id conn) 0)
+       (let* ((type-vector (mysql--param-type-vector params))
+              (packet (mysql--build-execute-packet
+                       stmt params type-vector mysql--stmt-cursor-read-only)))
+         (mysql--send-packet conn packet)
+         (setf (mysql-stmt-parameter-types stmt) type-vector))
+       (let ((packet (mysql--read-packet conn)))
+         (pcase (mysql--packet-type packet)
+           ('err
+            (let ((err-info (mysql--parse-err-packet packet)))
+              (signal 'mysql-stmt-error
+                      (list (format "[%d] %s"
+                                    (plist-get err-info :code)
+                                    (plist-get err-info :message))))))
+           ('ok
+            (signal 'mysql-stmt-error
+                    (list "Prepared statement did not return a cursor result set")))
+           (_
+            (let* ((col-count (mysql--result-column-count packet))
+                   (columns (mysql--read-column-definitions conn col-count)))
+              (make-mysql-cursor :stmt stmt :columns columns)))))))))
+
+(defun mysql--build-fetch-packet (stmt row-count)
+  "Build a COM_STMT_FETCH packet for STMT requesting ROW-COUNT rows."
+  (concat (unibyte-string #x1c)
+          (mysql--int-le-bytes (mysql-stmt-id stmt) 4)
+          (mysql--int-le-bytes row-count 4)))
+
+(defun mysql-fetch (cursor row-count)
+  "Fetch up to ROW-COUNT rows from CURSOR and return a `mysql-result'."
+  (unless (and (integerp row-count) (> row-count 0))
+    (signal 'mysql-stmt-error
+            (list (format "Fetch row count must be a positive integer: %S"
+                          row-count))))
+  (let* ((stmt (mysql-cursor-stmt cursor))
+         (conn (mysql-stmt-conn stmt))
+         (columns (mysql-cursor-columns cursor)))
+    (if (mysql-cursor-exhausted-p cursor)
+        (make-mysql-result :connection conn :status "OK" :columns columns :rows nil)
+      (mysql--run-command-response
+       conn "prepared statement cursor fetch"
+       (lambda ()
+         (setf (mysql-conn-sequence-id conn) 0)
+         (mysql--send-packet conn (mysql--build-fetch-packet stmt row-count))
+         (let* ((read (mysql--read-binary-rows-with-status conn columns))
+                (status-flags (plist-get read :status-flags)))
+           (when status-flags
+             (setf (mysql-conn-status-flags conn) status-flags)
+             (when (not (zerop (logand status-flags
+                                        mysql--server-status-last-row-sent)))
+               (setf (mysql-cursor-exhausted-p cursor) t)))
+           (make-mysql-result
+            :connection conn
+            :status "OK"
+            :columns columns
+            :rows (plist-get read :rows)
+            :warnings (plist-get read :warnings))))))))
+
+(defun mysql--stmt-reset (stmt)
+  "Reset prepared STMT server state and close its open cursor."
+  (let ((conn (mysql-stmt-conn stmt)))
+    (mysql--run-command-response
+     conn "prepared statement reset"
+     (lambda ()
+       (setf (mysql-conn-sequence-id conn) 0)
+       (mysql--send-packet conn (concat (unibyte-string #x1a)
+                                        (mysql--int-le-bytes (mysql-stmt-id stmt) 4)))
+       (let ((packet (mysql--read-packet conn)))
+         (pcase (mysql--packet-type packet)
+           ('ok
+            (setf (mysql-stmt-parameter-types stmt) nil)
+            t)
+           ('err
+            (let ((err-info (mysql--parse-err-packet packet)))
+              (signal 'mysql-stmt-error
+                      (list (format "[%d] %s"
+                                    (plist-get err-info :code)
+                                    (plist-get err-info :message))))))
+           (_
+            (signal 'mysql-protocol-error
+                    (list "Unexpected response to COM_STMT_RESET")))))))))
+
+(defun mysql-cursor-close (cursor)
+  "Close CURSOR on the server and return t.
+The prepared statement remains usable."
+  (unless (mysql-cursor-exhausted-p cursor)
+    (mysql--stmt-reset (mysql-cursor-stmt cursor)))
+  (setf (mysql-cursor-exhausted-p cursor) t)
+  t)
+
 (defun mysql-stmt-close (stmt)
   "Close prepared STMT.  No server response is expected."
   (let ((conn (mysql-stmt-conn stmt)))
@@ -1292,17 +1440,20 @@ Signals `mysql-error' if STMT's connection is busy with another command."
 
 ;; Binary result set reading
 
-(defun mysql--read-binary-rows (conn columns)
-  "Read binary row packets from CONN until EOF, returning rows in order.
-COLUMNS is the column-definition list.
-Binary rows start with 0x00 so we cannot use `mysql--packet-type';
-the result set ends with an EOF packet (0xFE, ≤9 bytes)."
-  (let (rows)
+(defun mysql--read-binary-rows-with-status (conn columns)
+  "Read binary row packets from CONN until EOF.
+COLUMNS is the column-definition list.  Return a plist with :rows,
+:warnings, and :status-flags."
+  (let ((type-vector (mysql--column-type-vector columns))
+        rows)
     (cl-loop
      (let ((row-packet (mysql--read-packet conn)))
        (cond
         ((and (= (aref row-packet 0) #xfe) (<= (length row-packet) 9))
-         (cl-return (nreverse rows)))
+         (let ((eof-info (mysql--parse-eof-packet row-packet)))
+           (cl-return (list :rows (nreverse rows)
+                            :warnings (plist-get eof-info :warnings)
+                            :status-flags (plist-get eof-info :status-flags)))))
         ((= (aref row-packet 0) #xff)
          (let ((err-info (mysql--parse-err-packet row-packet)))
            (signal 'mysql-stmt-error
@@ -1310,12 +1461,18 @@ the result set ends with an EOF packet (0xFE, ≤9 bytes)."
                                  (plist-get err-info :code)
                                  (plist-get err-info :message))))))
         (t
-         (push (mysql--parse-binary-row row-packet columns) rows)))))))
+         (push (mysql--parse-binary-row row-packet columns type-vector)
+               rows)))))))
+
+(defun mysql--read-binary-rows (conn columns)
+  "Read binary row packets from CONN until EOF, returning rows in order.
+COLUMNS is the column-definition list."
+  (plist-get (mysql--read-binary-rows-with-status conn columns) :rows))
 
 (defun mysql--read-binary-result-set (conn first-packet)
   "Read a binary protocol result set from CONN.
 FIRST-PACKET contains the column count.  Returns a `mysql-result'."
-  (let* ((col-count (aref first-packet 0))
+  (let* ((col-count (mysql--result-column-count first-packet))
          (columns   (cl-loop repeat col-count
                              collect (mysql--parse-column-definition
                                       (mysql--read-packet conn)))))
@@ -1334,19 +1491,21 @@ Binary row NULL bitmap has a 2-bit offset."
          (bit-idx (% offset 8)))
     (not (zerop (logand (aref null-bitmap byte-idx) (ash 1 bit-idx))))))
 
-(defun mysql--parse-binary-row (packet columns)
-  "Parse a binary protocol row from PACKET using COLUMNS metadata."
+(defun mysql--parse-binary-row (packet columns &optional type-vector)
+  "Parse a binary protocol row from PACKET using COLUMNS metadata.
+TYPE-VECTOR is a vector of column type codes."
   ;; First byte is 0x00 (packet header for binary rows)
   (let* ((col-count (length columns))
          (bitmap-len (/ (+ col-count 2 7) 8))
          (null-bitmap (substring packet 1 (+ 1 bitmap-len)))
+         (type-vector (or type-vector (mysql--column-type-vector columns)))
          (pos (+ 1 bitmap-len))
          (row nil))
     (dotimes (i col-count)
       (if (mysql--binary-null-p null-bitmap i)
           (push nil row)
         (pcase-let ((`(,val . ,new-pos) (mysql--decode-binary-value packet pos
-                                                                    (plist-get (nth i columns) :type))))
+                                                                    (aref type-vector i))))
           (push val row)
           (setq pos new-pos))))
     (nreverse row)))

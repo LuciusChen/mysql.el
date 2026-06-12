@@ -12,6 +12,7 @@ classic MySQL protocol directly and does not shell out to the =mysql= CLI.
 - Authentication with =caching_sha2_password=
 - Authentication with =sha256_password=
 - Prepared statements
+- Server-side prepared statement cursors with =mysql-execute-cursor= and =mysql-fetch=
 - Transactions
 - Public transaction helpers: =mysql-autocommit-p=, =mysql-in-transaction-p=,
   =mysql-set-autocommit=, =mysql-commit=, and =mysql-rollback=
