@@ -700,6 +700,54 @@
     (should (= (mysql-connection-port conn) 3306))
     (should (equal (mysql-current-database conn) "test"))))
 
+(ert-deftest mysql-test-send-packet-reports-closed-connection ()
+  "Sending on a closed process should signal `mysql-connection-error'."
+  (let* ((proc (make-process :name "mysql-test-closed"
+                             :buffer nil
+                             :command (list "cat")))
+         (buf (generate-new-buffer " *mysql-test-closed*"))
+         (conn (make-mysql-conn :process proc :buf buf)))
+    (unwind-protect
+        (progn
+          (delete-process proc)
+          (should-error (mysql--send-packet conn "x")
+                        :type 'mysql-connection-error))
+      (when (process-live-p proc)
+        (delete-process proc))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
+(ert-deftest mysql-test-disconnect-cleans-up-after-closed-connection ()
+  "Disconnect should still clean up when COM_QUIT sees a closed connection."
+  (let ((buf (generate-new-buffer " *mysql-test-disconnect-closed*"))
+        deleted)
+    (unwind-protect
+        (cl-letf (((symbol-function 'process-live-p) (lambda (_proc) t))
+                  ((symbol-function 'mysql--send-packet)
+                   (lambda (&rest _args)
+                     (signal 'mysql-connection-error '("Connection closed"))))
+                  ((symbol-function 'delete-process)
+                   (lambda (_proc) (setq deleted t))))
+          (mysql-disconnect (make-mysql-conn :process 'fake-proc :buf buf))
+          (should deleted)
+          (should-not (buffer-live-p buf)))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
+(ert-deftest mysql-test-disconnect-propagates-unexpected-send-error ()
+  "Disconnect should not swallow non-connection failures from COM_QUIT."
+  (let ((buf (generate-new-buffer " *mysql-test-disconnect-error*")))
+    (unwind-protect
+        (cl-letf (((symbol-function 'process-live-p) (lambda (_proc) t))
+                  ((symbol-function 'mysql--send-packet)
+                   (lambda (&rest _args)
+                     (error "Unexpected write failure"))))
+          (should-error
+           (mysql-disconnect (make-mysql-conn :process 'fake-proc :buf buf))
+           :type 'error))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
 (ert-deftest mysql-test-select-database-updates-cache-after-use ()
   "Test `mysql-select-database' updates CONN after a successful USE."
   (let ((conn (make-mysql-conn :database "old"))

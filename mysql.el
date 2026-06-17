@@ -307,6 +307,28 @@ Advances read-offset without deleting buffer content."
 
 ;;;; Packet I/O
 
+(defun mysql--closed-connection-error ()
+  "Signal that the MySQL connection is closed."
+  (signal 'mysql-connection-error (list "Connection closed")))
+
+(defun mysql--live-process (conn)
+  "Return CONN's live network process.
+Signal `mysql-connection-error' when CONN no longer has an open process."
+  (let ((proc (mysql-conn-process conn)))
+    (if (and (processp proc) (process-live-p proc))
+        proc
+      (mysql--closed-connection-error))))
+
+(defun mysql--send-string (proc string)
+  "Send STRING to PROC, translating closed-process errors.
+Unexpected process errors are re-signaled unchanged."
+  (condition-case err
+      (process-send-string proc string)
+    (error
+     (if (and (processp proc) (not (process-live-p proc)))
+         (mysql--closed-connection-error)
+       (signal (car err) (cdr err))))))
+
 (defun mysql--read-packet (conn)
   "Read one MySQL packet from CONN.
 Returns the payload as a unibyte string.  Handles packets split across
@@ -353,7 +375,7 @@ multiple 16 MB fragments."
   "Send PAYLOAD as a MySQL packet on CONN.
 Automatically prepends the 4-byte header (3-byte length + 1-byte sequence id).
 Handles splitting payloads larger than 0xFFFFFF."
-  (let ((proc (mysql-conn-process conn))
+  (let ((proc (mysql--live-process conn))
         (offset 0)
         (total (length payload)))
     (while (>= (- total offset) #xffffff)
@@ -361,17 +383,17 @@ Handles splitting payloads larger than 0xFFFFFF."
                             (unibyte-string (mysql-conn-sequence-id conn)))))
         (setf (mysql-conn-sequence-id conn)
               (logand (1+ (mysql-conn-sequence-id conn)) #xff))
-        (process-send-string proc header)
-        (process-send-string proc (substring payload offset (+ offset #xffffff)))
+        (mysql--send-string proc header)
+        (mysql--send-string proc (substring payload offset (+ offset #xffffff)))
         (cl-incf offset #xffffff)))
     (let* ((remaining (- total offset))
            (header (concat (mysql--int-le-bytes remaining 3)
                            (unibyte-string (mysql-conn-sequence-id conn)))))
       (setf (mysql-conn-sequence-id conn)
             (logand (1+ (mysql-conn-sequence-id conn)) #xff))
-      (process-send-string proc header)
+      (mysql--send-string proc header)
       (when (> remaining 0)
-        (process-send-string proc (substring payload offset))))))
+        (mysql--send-string proc (substring payload offset))))))
 
 ;;;; Authentication helpers
 
@@ -1141,12 +1163,13 @@ FIRST-PACKET contains the column-count.  Returns a `mysql-result'."
   "Disconnect from MySQL server, sending COM_QUIT.
 CONN is a `mysql-conn' returned by `mysql-connect'."
   (when conn
-    (condition-case nil
+    (condition-case err
         (when (process-live-p (mysql-conn-process conn))
           ;; Send COM_QUIT
           (setf (mysql-conn-sequence-id conn) 0)
           (mysql--send-packet conn (unibyte-string #x01)))
-      (error nil))
+      (mysql-connection-error nil)
+      (error (signal (car err) (cdr err))))
     (when (process-live-p (mysql-conn-process conn))
       (delete-process (mysql-conn-process conn)))
     (when (buffer-live-p (mysql-conn-buf conn))
