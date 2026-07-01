@@ -98,6 +98,15 @@
                   (unibyte-string #xfd #x01 #x00 #x00) 0)
                  '(1 . 4))))
 
+(ert-deftest mysql-test-lenenc-int-from-string-rejects-truncated ()
+  "Truncated length-encoded integers should signal `mysql-protocol-error'."
+  (dolist (packet (list ""
+                        (unibyte-string #xfc #x01)
+                        (unibyte-string #xfd #x01 #x02)
+                        (unibyte-string #xfe #x00 #x00 #x02 #x00)))
+    (should-error (mysql--read-lenenc-int-from-string packet 0)
+                  :type 'mysql-protocol-error)))
+
 (ert-deftest mysql-test-read-lenenc-string-from-string ()
   "Test reading length-encoded strings."
   (should (equal (mysql--read-lenenc-string-from-string
@@ -239,7 +248,7 @@
   (should (equal (mysql-escape-literal "back\\slash") "'back\\\\slash'")))
 
 (ert-deftest mysql-test-uri-parsing ()
-  "Test MySQL URI parsing via regex."
+  "Test MySQL URI parsing and percent decoding."
   ;; Test that the regex matches valid URIs
   (should (string-match
            "\\`mysql://\\([^:@]*\\)\\(?::\\([^@]*\\)\\)?@\\([^:/]*\\)\\(?::\\([0-9]+\\)\\)?\\(?:/\\(.*\\)\\)?\\'"
@@ -253,7 +262,12 @@
   (should (string-match
            "\\`mysql://\\([^:@]*\\)\\(?::\\([^@]*\\)\\)?@\\([^:/]*\\)\\(?::\\([0-9]+\\)\\)?\\(?:/\\(.*\\)\\)?\\'"
            "mysql://root:pass@localhost/mydb"))
-  (should (null (match-string 4 "mysql://root:pass@localhost/mydb"))))
+  (should (null (match-string 4 "mysql://root:pass@localhost/mydb")))
+  (cl-letf (((symbol-function 'mysql-connect) #'list))
+    (should (equal (mysql-connect-uri
+                    "mysql://user:p%40ss@localhost:3307/app%2Fdata")
+                   '(:host "localhost" :port 3307 :user "user"
+                     :password "p@ss" :database "app/data")))))
 
 (ert-deftest mysql-test-transaction-state-helpers ()
   "Test autocommit and transaction status helpers."
@@ -660,12 +674,31 @@
          (row (mysql--parse-result-row packet 2 types)))
     (should (equal row '(42 "hello")))))
 
+(ert-deftest mysql-test-read-text-rows-keeps-empty-string-row ()
+  "A row whose first column is an empty string is not an OK terminator."
+  (let ((conn (make-mysql-conn))
+        (packets (list (unibyte-string #x00)
+                       (unibyte-string #xfe #x00 #x00 #x02 #x00)))
+        (read-count 0))
+    (cl-letf (((symbol-function 'mysql--read-packet)
+               (lambda (_conn)
+                 (cl-incf read-count)
+                 (pop packets))))
+      (should (equal (mysql--read-text-rows
+                      conn 1 (list (list :type mysql-type-var-string)))
+                     '((""))))
+      (should (= read-count 2))
+      (should-not packets))))
+
 (ert-deftest mysql-test-result-column-count ()
   "Test result-set header column count decoding."
   (should (= (mysql--result-column-count (unibyte-string 3)) 3))
   (should (= (mysql--result-column-count
               (concat (unibyte-string #xfc) (mysql--int-le-bytes 260 2)))
-             260)))
+             260))
+  (should-error (mysql--result-column-count
+                 (unibyte-string #xfe #x00 #x00 #x02 #x00))
+                :type 'mysql-protocol-error))
 
 (ert-deftest mysql-test-parse-eof-packet ()
   "Test EOF packet status parsing."
@@ -763,7 +796,8 @@
 
 (ert-deftest mysql-test-drain-query-response-restores-timeout-and-busy ()
   "Draining a response should mark CONN busy and restore its timeout."
-  (let ((conn (make-mysql-conn :read-idle-timeout 30))
+  (let ((conn (make-mysql-conn :read-idle-timeout 30
+                               :response-pending t))
         observed-timeout
         observed-busy
         observed-packet)
@@ -783,11 +817,13 @@
       (should (= observed-timeout 0.25))
       (should observed-busy)
       (should-not (mysql-conn-busy conn))
+      (should-not (mysql-conn-response-pending conn))
       (should (= (mysql-conn-read-idle-timeout conn) 30)))))
 
 (ert-deftest mysql-test-drain-query-response-propagates-query-error ()
   "Draining should consume an ERR response but still signal `mysql-query-error'."
-  (let ((conn (make-mysql-conn :read-idle-timeout 30))
+  (let ((conn (make-mysql-conn :read-idle-timeout 30
+                               :response-pending t))
         drained)
     (cl-letf (((symbol-function 'mysql--read-packet)
                (lambda (_conn) "err-packet"))
@@ -800,7 +836,85 @@
                     :type 'mysql-query-error)
       (should drained)
       (should-not (mysql-conn-busy conn))
+      (should-not (mysql-conn-response-pending conn))
       (should (= (mysql-conn-read-idle-timeout conn) 30)))))
+
+(ert-deftest mysql-test-timeout-blocks-commands-until-response-is-drained ()
+  "A timed-out command should leave CONN reserved for response draining."
+  (let ((conn (make-mysql-conn))
+        called)
+    (should-error
+     (mysql--run-command-response
+      conn "query"
+      (lambda ()
+        (setf (mysql-conn-response-drainable conn) t)
+        (signal 'mysql-timeout '("timed out"))))
+     :type 'mysql-timeout)
+    (should (mysql-conn-response-pending conn))
+    (should-not (mysql-conn-busy conn))
+    (should-error
+     (mysql--run-command-response conn "next query"
+                                  (lambda () (setq called t)))
+     :type 'mysql-error)
+    (should-not called)))
+
+(ert-deftest mysql-test-nondrainable-timeout-closes-connection ()
+  "A timeout after response parsing starts should close CONN."
+  (let* ((buffer (generate-new-buffer " *mysql-test-nondrainable*"))
+         (process (make-pipe-process :name "mysql-test-nondrainable"
+                                     :buffer buffer :noquery t))
+         (conn (make-mysql-conn :process process :buf buffer)))
+    (should-error
+     (mysql--run-command-response
+      conn "query" (lambda () (signal 'mysql-timeout '("timed out"))))
+     :type 'mysql-timeout)
+    (should-not (mysql-live-p conn))
+    (should-not (buffer-live-p buffer))
+    (should-not (mysql-conn-response-pending conn))))
+
+(ert-deftest mysql-test-active-nonlocal-exit-preserves-response-for-drain ()
+  "A nonlocal exit during a drainable query should leave CONN drainable."
+  (let* ((buffer (generate-new-buffer " *mysql-test-active-quit*"))
+         (process (make-pipe-process :name "mysql-test-active-quit"
+                                     :buffer buffer :noquery t))
+         (conn (make-mysql-conn :process process :buf buffer)))
+    (unwind-protect
+        (progn
+          (should
+           (eq (catch 'mysql-test-active-exit
+                 (mysql--run-command-response
+                  conn "query"
+                  (lambda ()
+                    (setf (mysql-conn-response-drainable conn) t)
+                    (throw 'mysql-test-active-exit :quit))))
+               :quit))
+          (should (mysql-live-p conn))
+          (should (buffer-live-p buffer))
+          (should (mysql-conn-response-pending conn))
+          (should-not (mysql-conn-response-active conn)))
+      (when (process-live-p process)
+        (delete-process process))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
+(ert-deftest mysql-test-read-packet-timeout-restores-packet-offset ()
+  "A partial packet read should be restartable by response draining."
+  (let* ((buffer (generate-new-buffer " *mysql-test-partial-packet*"))
+         (process (make-pipe-process :name "mysql-test-partial-packet"
+                                     :buffer buffer :noquery t))
+         (conn (make-mysql-conn :process process :buf buffer
+                                :read-idle-timeout 0
+                                :sequence-id 9)))
+    (unwind-protect
+        (progn
+          (with-current-buffer buffer
+            (set-buffer-multibyte nil)
+            (insert (unibyte-string 3 0 0 4 ?x)))
+          (should-error (mysql--read-packet conn) :type 'mysql-timeout)
+          (should (= (mysql-conn-read-offset conn) 0))
+          (should (= (mysql-conn-sequence-id conn) 9)))
+      (delete-process process)
+      (kill-buffer buffer))))
 
 (ert-deftest mysql-test-drain-query-response-rejects-busy-connection ()
   "Draining should not run while CONN is already busy."
@@ -808,6 +922,11 @@
     (should-error (mysql-drain-query-response conn)
                   :type 'mysql-error)
     (should (mysql-conn-busy conn))))
+
+(ert-deftest mysql-test-drain-query-response-requires-pending-state ()
+  "Draining without an interrupted query should fail immediately."
+  (should-error (mysql-drain-query-response (make-mysql-conn))
+                :type 'mysql-error))
 
 (ert-deftest mysql-test-open-connection-does-not-force-plain-type ()
   "Opening a MySQL socket should not force an unsupported process type."
@@ -825,6 +944,23 @@
               (should (eq proc 'fake-proc))
               (should-not (plist-member captured-args :type)))
           (kill-buffer buf))))))
+
+(ert-deftest mysql-test-open-connection-cleans-buffer-on-create-error ()
+  "A socket creation failure should not leak the input buffer."
+  (let (buffer)
+    (cl-letf (((symbol-function 'generate-new-buffer)
+               (lambda (_name)
+                 (setq buffer (get-buffer-create " *mysql-test-open-error*"))))
+              ((symbol-function 'make-network-process)
+               (lambda (&rest _args) (error "connect failed"))))
+      (should-error (mysql--open-connection "invalid" 3306 1))
+      (should-not (buffer-live-p buffer)))))
+
+(ert-deftest mysql-test-stmt-close-rejects-pending-response ()
+  "Statement close should not interleave with a pending response."
+  (let* ((conn (make-mysql-conn :response-pending t))
+         (stmt (make-mysql-stmt :conn conn :id 1)))
+    (should-error (mysql-stmt-close stmt) :type 'mysql-error)))
 
 (ert-deftest mysql-test-connect-retries-caching-sha2-full-auth-with-tls ()
   "A non-TLS caching_sha2 full-auth failure should reconnect with TLS."
@@ -1001,9 +1137,13 @@ Skips if `mysql-test-password' is nil."
   :tags '(:mysql-live)
   "Test query returning multiple rows."
   (mysql-test--with-conn conn
-    (let ((result (mysql-query conn "SELECT user, host FROM user LIMIT 5")))
+    (mysql-query conn "CREATE TEMPORARY TABLE _mysql_el_multi_row (id INT, name VARCHAR(20))")
+    (mysql-query conn "INSERT INTO _mysql_el_multi_row VALUES (1, 'one'), (2, 'two'), (3, 'three')")
+    (let ((result (mysql-query conn "SELECT id, name FROM _mysql_el_multi_row ORDER BY id")))
       (should (mysql-result-p result))
-      (should (>= (length (mysql-result-rows result)) 1)))))
+      (should (= (length (mysql-result-rows result)) 3))
+      (should (equal (mysql-result-rows result)
+                     '((1 "one") (2 "two") (3 "three")))))))
 
 (ert-deftest mysql-test-live-dml ()
   :tags '(:mysql-live)

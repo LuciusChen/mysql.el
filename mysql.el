@@ -47,6 +47,7 @@
 
 (require 'cl-lib)
 (require 'subr-x)
+(require 'url-util)
 
 (declare-function gnutls-negotiate "gnutls" (&rest _spec))
 
@@ -71,7 +72,6 @@
 (defconst mysql--cap-secure-connection    #x00008000)
 (defconst mysql--cap-ssl                  #x00000800)
 (defconst mysql--cap-plugin-auth          #x00080000)
-(defconst mysql--cap-plugin-auth-lenenc   #x00200000)
 (defconst mysql--cap-deprecate-eof        #x01000000)
 
 ;;;; Server status flags
@@ -167,7 +167,10 @@ also accepted."
   (sequence-id 0)
   (read-offset 0)
   tls
-  (busy nil))
+  (busy nil)
+  (response-active nil)
+  (response-pending nil)
+  (response-drainable nil))
 
 (cl-defstruct mysql-result
   "A MySQL query result."
@@ -213,32 +216,57 @@ also accepted."
 
 ;;;; Command response guard
 
-(defun mysql--clear-input-buffer (conn)
-  "Discard unread input bytes buffered on CONN."
-  (when-let* ((buf (mysql-conn-buf conn))
-              ((buffer-live-p buf)))
-    (with-current-buffer buf
-      (erase-buffer)
-      (setf (mysql-conn-read-offset conn) 0))))
-
-(defun mysql--run-command-response (conn command-name fn)
-  "Run FN as an exclusive response-reading command on CONN.
-COMMAND-NAME is used in the busy-connection error message."
+(defun mysql--ensure-command-ready (conn command-name)
+  "Ensure CONN can start COMMAND-NAME."
   (when (mysql-conn-busy conn)
     (signal 'mysql-error
             (list (format "Connection busy — cannot send %s while another command is in progress"
                           command-name))))
-  ;; Flush any stale data left from a previously interrupted command.
-  (mysql--clear-input-buffer conn)
+  (when (mysql-conn-response-pending conn)
+    (signal 'mysql-error
+            (list (format "Connection has a pending response — drain it before sending %s"
+                          command-name)))))
+
+(defun mysql--handle-command-interruption (conn &optional preserve-active)
+  "Preserve a drainable response on CONN, or close an unsafe connection.
+When PRESERVE-ACTIVE is non-nil, preserve an active response even after its
+first packet has been read.  This supports user interruption followed by an
+out-of-band server-side cancel."
+  (if (or (mysql-conn-response-drainable conn)
+          (and preserve-active (mysql-conn-response-active conn)))
+      (setf (mysql-conn-response-pending conn) t)
+    (mysql--cleanup-connection-resources
+     (mysql-conn-process conn) (mysql-conn-buf conn)))
+  (setf (mysql-conn-response-drainable conn) nil))
+
+(defun mysql--run-command-response (conn command-name fn)
+  "Run FN as an exclusive response-reading command on CONN.
+COMMAND-NAME is used in the busy-connection error message."
+  (mysql--ensure-command-ready conn command-name)
   (setf (mysql-conn-busy conn) t)
-  (unwind-protect
-      ;; Bind throw-on-input to nil so that `while-no-input' (used by
-      ;; completion frameworks like corfu/company) cannot abort us
-      ;; mid-response, which would leave partial data in the buffer and
-      ;; corrupt subsequent commands.
-      (let ((throw-on-input nil))
-        (funcall fn))
-    (setf (mysql-conn-busy conn) nil)))
+  (let (completed handled)
+    (unwind-protect
+        (condition-case err
+            ;; Bind throw-on-input to nil so that `while-no-input' (used by
+            ;; completion frameworks like corfu/company) cannot abort us
+            ;; mid-response.
+            (prog1 (let ((throw-on-input nil))
+                     (funcall fn))
+              (setq completed t))
+          (mysql-timeout
+           (setq handled t)
+           (mysql--handle-command-interruption conn)
+           (signal (car err) (cdr err)))
+          (quit
+           (setq handled t)
+           (mysql--handle-command-interruption conn t)
+           (signal (car err) (cdr err))))
+      (when (and (not completed)
+                 (not handled)
+                 (mysql-conn-response-drainable conn))
+        (mysql--handle-command-interruption conn t))
+      (setf (mysql-conn-busy conn) nil
+            (mysql-conn-response-active conn) nil))))
 
 ;;;; Low-level I/O primitives
 
@@ -294,17 +322,6 @@ Advances read-offset without deleting buffer content."
       (setq i (1+ i)))
     val))
 
-(defun mysql--read-lenenc-int (conn)
-  "Read a length-encoded integer from CONN."
-  (let ((first (mysql--read-byte conn)))
-    (cond
-     ((< first #xfb) first)
-     ((= first #xfc) (mysql--read-int-le conn 2))
-     ((= first #xfd) (mysql--read-int-le conn 3))
-     ((= first #xfe) (mysql--read-int-le conn 8))
-     (t (signal 'mysql-protocol-error
-                (list (format "Invalid lenenc-int prefix: 0x%02x" first)))))))
-
 ;;;; Packet I/O
 
 (defun mysql--closed-connection-error ()
@@ -333,22 +350,29 @@ Unexpected process errors are re-signaled unchanged."
   "Read one MySQL packet from CONN.
 Returns the payload as a unibyte string.  Handles packets split across
 multiple 16 MB fragments."
-  (let ((payload nil)
-        (more t))
-    (while more
-      (let* ((len (mysql--read-int-le conn 3))
-             (seq (mysql--read-byte conn)))
-        (setf (mysql-conn-sequence-id conn) (logand (1+ seq) #xff))
-        (let ((data (mysql--read-bytes conn len)))
-          (push data payload))
-        (setq more (= len #xffffff))))
-    ;; Bulk-flush all bytes consumed by this packet; one delete-region per packet.
-    (with-current-buffer (mysql-conn-buf conn)
-      (let ((off (mysql-conn-read-offset conn)))
-        (when (> off 0)
-          (delete-region (point-min) (+ (point-min) off))
-          (setf (mysql-conn-read-offset conn) 0))))
-    (apply #'concat (nreverse payload))))
+  (let ((initial-offset (mysql-conn-read-offset conn))
+        (initial-sequence-id (mysql-conn-sequence-id conn)))
+    (condition-case err
+        (let ((payload nil)
+              (more t))
+          (while more
+            (let* ((len (mysql--read-int-le conn 3))
+                   (seq (mysql--read-byte conn)))
+              (setf (mysql-conn-sequence-id conn) (logand (1+ seq) #xff))
+              (let ((data (mysql--read-bytes conn len)))
+                (push data payload))
+              (setq more (= len #xffffff))))
+          ;; Bulk-flush all bytes consumed by this packet; one delete-region per packet.
+          (with-current-buffer (mysql-conn-buf conn)
+            (let ((off (mysql-conn-read-offset conn)))
+              (when (> off 0)
+                (delete-region (point-min) (+ (point-min) off))
+                (setf (mysql-conn-read-offset conn) 0))))
+          (apply #'concat (nreverse payload)))
+      ((mysql-timeout quit)
+       (setf (mysql-conn-read-offset conn) initial-offset
+             (mysql-conn-sequence-id conn) initial-sequence-id)
+       (signal (car err) (cdr err))))))
 
 (defun mysql--int-le-bytes (value n)
   "Encode VALUE as a little-endian unibyte string of N bytes."
@@ -624,20 +648,32 @@ Returns one of: ok, err, eof, local-infile, or data."
 (defun mysql--read-lenenc-int-from-string (str pos)
   "Read a length-encoded integer from STR at POS.
 Returns (value . new-pos)."
+  (when (>= pos (length str))
+    (signal 'mysql-protocol-error
+            (list "Truncated length-encoded integer")))
   (let ((first (aref str pos)))
     (cond
      ((< first #xfb)
       (cons first (1+ pos)))
      ((= first #xfc)
+      (when (> (+ pos 3) (length str))
+        (signal 'mysql-protocol-error
+                (list "Truncated 2-byte length-encoded integer")))
       (cons (logior (aref str (+ pos 1))
                     (ash (aref str (+ pos 2)) 8))
             (+ pos 3)))
      ((= first #xfd)
+      (when (> (+ pos 4) (length str))
+        (signal 'mysql-protocol-error
+                (list "Truncated 3-byte length-encoded integer")))
       (cons (logior (aref str (+ pos 1))
                     (ash (aref str (+ pos 2)) 8)
                     (ash (aref str (+ pos 3)) 16))
             (+ pos 4)))
      ((= first #xfe)
+      (when (> (+ pos 9) (length str))
+        (signal 'mysql-protocol-error
+                (list "Truncated 8-byte length-encoded integer")))
       (let ((val 0))
         (dotimes (i 8)
           (setq val (logior val (ash (aref str (+ pos 1 i)) (* i 8)))))
@@ -911,23 +947,30 @@ PASSWORD is the plaintext password; TLS non-nil means upgrade to TLS first."
   "Open a raw TCP connection to HOST:PORT for MySQL.
 CONNECT-TIMEOUT, when non-nil, limits the initial socket connect.
 Returns (PROCESS . BUFFER)."
-  (let ((buf (generate-new-buffer " *mysql-input*")))
+  (let ((buf (generate-new-buffer " *mysql-input*"))
+        proc
+        opened)
     (with-current-buffer buf
       (set-buffer-multibyte nil))
-    (let ((proc (make-network-process :name "mysql"
-                                      :buffer buf
-                                      :host host
-                                      :service port
-                                      :nowait t
-                                      :coding 'binary)))
-      (set-process-coding-system proc 'binary 'binary)
-      (set-process-filter proc
-                          (lambda (_proc data)
-                            (with-current-buffer buf
-                              (goto-char (point-max))
-                              (insert data))))
-      (mysql--wait-for-connect proc host port connect-timeout)
-      (cons proc buf))))
+    (unwind-protect
+        (progn
+          (setq proc (make-network-process :name "mysql"
+                                           :buffer buf
+                                           :host host
+                                           :service port
+                                           :nowait t
+                                           :coding 'binary))
+          (set-process-coding-system proc 'binary 'binary)
+          (set-process-filter proc
+                              (lambda (_proc data)
+                                (with-current-buffer buf
+                                  (goto-char (point-max))
+                                  (insert data))))
+          (mysql--wait-for-connect proc host port connect-timeout)
+          (setq opened t)
+          (cons proc buf))
+      (unless opened
+        (mysql--cleanup-connection-resources proc buf)))))
 
 (cl-defun mysql-connect (&key (host "127.0.0.1") (port 3306) user password
                                 database (tls nil tls-specified-p) ssl-mode
@@ -1080,7 +1123,11 @@ Signals `mysql-error' if CONN is busy with another command."
      (setf (mysql-conn-sequence-id conn) 0)
      (mysql--send-packet conn (concat (unibyte-string #x03)
                                       (encode-coding-string sql 'utf-8)))
-     (mysql--handle-query-response conn (mysql--read-packet conn)))))
+     (setf (mysql-conn-response-active conn) t
+           (mysql-conn-response-drainable conn) t)
+     (let ((packet (mysql--read-packet conn)))
+       (setf (mysql-conn-response-drainable conn) nil)
+       (mysql--handle-query-response conn packet)))))
 
 (defun mysql-drain-query-response (conn &optional read-idle-timeout)
   "Read and discard one pending query response from CONN.
@@ -1092,12 +1139,15 @@ while draining, then restore the previous timeout.
 
 Return t after a complete OK or result-set response is consumed.  If
 the pending response is a MySQL ERR packet, signal `mysql-query-error'
-after consuming that response.  Signal `mysql-error' if CONN is busy or
-if the response cannot be fully consumed."
+after consuming that response.  Signal `mysql-error' if CONN is busy,
+has no pending response, or cannot consume the response completely."
   (when (mysql-conn-busy conn)
     (signal 'mysql-error
             (list "Connection busy — cannot drain a query response while another command is in progress")))
-  (let ((old-timeout (mysql-conn-read-idle-timeout conn)))
+  (unless (mysql-conn-response-pending conn)
+    (signal 'mysql-error (list "Connection has no pending query response")))
+  (let ((old-timeout (mysql-conn-read-idle-timeout conn))
+        synchronized)
     (unwind-protect
         (condition-case err
             (progn
@@ -1105,10 +1155,14 @@ if the response cannot be fully consumed."
                 (setf (mysql-conn-read-idle-timeout conn) read-idle-timeout))
               (setf (mysql-conn-busy conn) t)
               (mysql--handle-query-response conn (mysql--read-packet conn))
+              (setq synchronized t)
               t)
           (mysql-query-error
+           (setq synchronized t)
            (signal (car err) (cdr err))))
       (setf (mysql-conn-busy conn) nil)
+      (when synchronized
+        (setf (mysql-conn-response-pending conn) nil))
       (setf (mysql-conn-read-idle-timeout conn) old-timeout))))
 
 (defun mysql--read-column-definitions (conn col-count)
@@ -1134,7 +1188,7 @@ COL-COUNT and COLUMNS guide parsing.  Returns rows in order."
     (cl-loop
      (let ((row-packet (mysql--read-packet conn)))
        (pcase (mysql--packet-type row-packet)
-         ((or 'eof 'ok) (cl-return nil))
+         ('eof (cl-return nil))
          ('err
           (let ((err-info (mysql--parse-err-packet row-packet)))
             (signal 'mysql-query-error
@@ -1457,9 +1511,15 @@ The prepared statement remains usable."
 (defun mysql-stmt-close (stmt)
   "Close prepared STMT.  No server response is expected."
   (let ((conn (mysql-stmt-conn stmt)))
-    (setf (mysql-conn-sequence-id conn) 0)
-    (mysql--send-packet conn (concat (unibyte-string #x19)
-                                     (mysql--int-le-bytes (mysql-stmt-id stmt) 4)))))
+    (mysql--ensure-command-ready conn "prepared statement close")
+    (setf (mysql-conn-busy conn) t)
+    (unwind-protect
+        (progn
+          (setf (mysql-conn-sequence-id conn) 0)
+          (mysql--send-packet conn (concat (unibyte-string #x19)
+                                           (mysql--int-le-bytes
+                                            (mysql-stmt-id stmt) 4))))
+      (setf (mysql-conn-busy conn) nil))))
 
 ;; Binary result set reading
 
@@ -1788,15 +1848,21 @@ URI format: mysql://user:password@host:port/database"
            "\\`mysql://\\([^:@]*\\)\\(?::\\([^@]*\\)\\)?@\\([^:/]*\\)\\(?::\\([0-9]+\\)\\)?\\(?:/\\(.*\\)\\)?\\'"
            uri)
     (signal 'mysql-connection-error (list (format "Invalid MySQL URI: %s" uri))))
-  (let ((user (match-string 1 uri))
-        (password (match-string 2 uri))
-        (host (match-string 3 uri))
-        (port (if-let* ((p (match-string 4 uri))) (string-to-number p) 3306))
-        (database (match-string 5 uri)))
-    (mysql-connect :host host :port port :user user
-                   :password password
-                   :database (if (or (null database) (string-empty-p database))
-                                 nil database))))
+  (pcase-let ((`(,raw-user ,raw-password ,host ,raw-port ,raw-database)
+               (mapcar (lambda (index) (match-string index uri))
+                       '(1 2 3 4 5))))
+    (let ((user (decode-coding-string (url-unhex-string raw-user) 'utf-8 t))
+          (password (and raw-password
+                         (decode-coding-string
+                          (url-unhex-string raw-password) 'utf-8 t)))
+          (port (if raw-port (string-to-number raw-port) 3306))
+          (database (and raw-database
+                         (decode-coding-string
+                          (url-unhex-string raw-database) 'utf-8 t))))
+      (mysql-connect :host host :port port :user user
+                     :password password
+                     :database (if (or (null database) (string-empty-p database))
+                                   nil database)))))
 
 (provide 'mysql)
 ;;; mysql.el ends here

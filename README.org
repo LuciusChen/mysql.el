@@ -20,6 +20,7 @@ classic MySQL protocol directly and does not shell out to the =mysql= CLI.
   =mysql-connection-id=, =mysql-current-database=, and =mysql-select-database=
 - Public response drain helper for clients that cancel a running query out of
   band: =mysql-drain-query-response=
+- Percent-decoded =mysql://= connection URIs through =mysql-connect-uri=
 - Support for MySQL 5.6+, MySQL 8.x, and MariaDB 10.11+
 
 * Usage
@@ -49,6 +50,14 @@ session state:
       (mysql-commit conn))
   (mysql-set-autocommit conn t))
 #+end_src
+
+* Timeout recovery
+
+When a query times out before its first response packet is complete, the
+connection rejects new commands until =mysql-drain-query-response= consumes the
+pending response.  If a timeout happens after result parsing has started, the
+connection is closed because the generic drain API cannot safely reconstruct
+the partially consumed result set.
 
 * Installation
 
