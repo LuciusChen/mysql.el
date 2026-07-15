@@ -909,7 +909,7 @@
         (progn
           (with-current-buffer buffer
             (set-buffer-multibyte nil)
-            (insert (unibyte-string 3 0 0 4 ?x)))
+            (insert (unibyte-string 3 0 0 9 ?x)))
           (should-error (mysql--read-packet conn) :type 'mysql-timeout)
           (should (= (mysql-conn-read-offset conn) 0))
           (should (= (mysql-conn-sequence-id conn) 9)))
@@ -1093,6 +1093,117 @@
                                :user "root" :password "pw"
                                :database "mysql" :ssl-mode 'required)
                 :type 'mysql-connection-error))
+
+;;;; Protocol hardening regressions
+
+(ert-deftest mysql-test-binary-row-uses-full-column-metadata ()
+  "Binary rows should honor signedness and decode typed strings."
+  (let* ((utf8 (encode-coding-string "中文" 'utf-8))
+         (json (encode-coding-string "{\"x\":1}" 'utf-8))
+         (columns (list (list :type mysql-type-long :flags 0)
+                        (list :type mysql-type-long
+                              :flags mysql--column-flag-unsigned)
+                        (list :type mysql-type-var-string :flags 0
+                              :character-set 45)
+                        (list :type mysql-type-bit :flags 0
+                              :character-set mysql--binary-character-set)
+                        (list :type mysql-type-newdecimal :flags 0
+                              :character-set 45)
+                        (list :type mysql-type-json :flags 0
+                              :character-set 45)))
+         (packet (concat (unibyte-string 0 0)
+                         (mysql--int-le-bytes #xffffffff 4)
+                         (mysql--int-le-bytes #xffffffff 4)
+                         (mysql--lenenc-int-bytes (length utf8)) utf8
+                         (unibyte-string 2 1 0)
+                         (unibyte-string 4) "12.5"
+                         (mysql--lenenc-int-bytes (length json)) json))
+         (row (mysql--parse-binary-row packet columns)))
+    (should (= (nth 0 row) -1))
+    (should (= (nth 1 row) #xffffffff))
+    (should (equal (nth 2 row) "中文"))
+    (should (= (nth 3 row) 256))
+    (should (= (nth 4 row) 12.5))
+    (should (= (gethash "x" (nth 5 row)) 1))))
+
+(ert-deftest mysql-test-binary-blob-type-respects-character-set ()
+  "BLOB wire types should still decode textual columns by character set."
+  (let ((value (encode-coding-string "中文" 'utf-8)))
+    (should
+     (equal (mysql--binary-text-value
+             value (list :type mysql-type-blob :flags 0 :character-set 45))
+            "中文"))
+    (should
+     (equal (mysql--binary-text-value
+             value (list :type mysql-type-blob :flags 0
+                         :character-set mysql--binary-character-set))
+            value))))
+
+(ert-deftest mysql-test-read-packet-rejects-sequence-mismatch ()
+  "Incoming fragments must match the expected packet sequence."
+  (let* ((buffer (generate-new-buffer " *mysql-test-sequence*"))
+         (process (make-pipe-process :name "mysql-test-sequence"
+                                     :buffer buffer :noquery t))
+         (conn (make-mysql-conn :process process :buf buffer :sequence-id 3)))
+    (with-current-buffer buffer
+      (set-buffer-multibyte nil)
+      (insert (unibyte-string 1 0 0 4 ?x)))
+    (should-error (mysql--read-packet conn) :type 'mysql-protocol-error)
+    (should-not (mysql-live-p conn))
+    (should-not (buffer-live-p buffer))))
+
+(ert-deftest mysql-test-read-packet-enforces-message-and-response-limits ()
+  "Logical packet and command response byte budgets should be bounded."
+  (dolist (limits '((2 100) (100 2)))
+    (let* ((buffer (generate-new-buffer " *mysql-test-limit*"))
+           (process (make-pipe-process :name "mysql-test-limit"
+                                       :buffer buffer :noquery t))
+           (conn (make-mysql-conn :process process :buf buffer)))
+      (with-current-buffer buffer
+        (set-buffer-multibyte nil)
+        (insert (unibyte-string 3 0 0 0 ?a ?b ?c)))
+      (let ((mysql-max-message-bytes (car limits))
+            (mysql-max-response-bytes (cadr limits)))
+        (should-error (mysql--read-packet conn) :type 'mysql-protocol-error))
+      (should-not (mysql-live-p conn))
+      (should-not (buffer-live-p buffer)))))
+
+(ert-deftest mysql-test-auth-response-fails-closed ()
+  "Unknown and incomplete authentication packets should be rejected."
+  (dolist (packet (list "" (unibyte-string #x02) (unibyte-string #x01)))
+    (cl-letf (((symbol-function 'mysql--read-packet)
+               (lambda (_conn) packet)))
+      (should-error
+       (mysql--handle-auth-response (make-mysql-conn) "pw" "salt"
+                                    "caching_sha2_password")
+       :type 'mysql-auth-error))))
+
+(ert-deftest mysql-test-result-parse-error-invalidates-connection ()
+  "A structural error mid-response must make the stream unusable."
+  (let* ((buffer (generate-new-buffer " *mysql-test-parse-error*"))
+         (process (make-pipe-process :name "mysql-test-parse-error"
+                                     :buffer buffer :noquery t))
+         (conn (make-mysql-conn :process process :buf buffer
+                                :capability-flags 0)))
+    (cl-letf (((symbol-function 'mysql--read-packet)
+               (lambda (_conn) (unibyte-string 1))))
+      (should-error (mysql--read-result-set conn (unibyte-string 1))))
+    (should-not (mysql-live-p conn))
+    (should-not (buffer-live-p buffer))))
+
+(ert-deftest mysql-test-binary-row-parse-error-invalidates-connection ()
+  "A malformed prepared-row response must invalidate the stream."
+  (let* ((buffer (generate-new-buffer " *mysql-test-binary-parse-error*"))
+         (process (make-pipe-process :name "mysql-test-binary-parse-error"
+                                     :buffer buffer :noquery t))
+         (conn (make-mysql-conn :process process :buf buffer)))
+    (cl-letf (((symbol-function 'mysql--read-packet)
+               (lambda (_conn) (unibyte-string 0 0))))
+      (should-error
+       (mysql--read-binary-rows-with-status
+        conn (list (list :type mysql-type-longlong :flags 0)))))
+    (should-not (mysql-live-p conn))
+    (should-not (buffer-live-p buffer))))
 
 ;;;; Live integration tests (require a running MySQL server)
 

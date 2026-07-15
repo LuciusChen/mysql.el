@@ -59,6 +59,12 @@ pending response.  If a timeout happens after result parsing has started, the
 connection is closed because the generic drain API cannot safely reconstruct
 the partially consumed result set.
 
+Version 0.2.4 validates every packet sequence and bounds logical messages and
+command responses with =mysql-max-message-bytes= and
+=mysql-max-response-bytes=.  Authentication packets now fail closed, and
+prepared binary rows honor column signedness and decode text, JSON, DECIMAL,
+BIT, and binary values from full column metadata.
+
 * Installation
 
 Install =mysql= from MELPA:
