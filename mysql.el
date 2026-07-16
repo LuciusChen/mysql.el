@@ -46,6 +46,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'json)
 (require 'subr-x)
 (require 'url-util)
 
@@ -868,7 +869,7 @@ or nil for zero datetimes."
       (16               (mysql--parse-bit value))
       (245
        (let ((s (decode-coding-string value 'utf-8)))
-         (if (fboundp 'json-parse-string) (json-parse-string s) s)))
+         (json-parse-string s)))
       (_                (decode-coding-string value 'utf-8)))))
 
 (defun mysql--parse-value (value type)
@@ -880,7 +881,7 @@ Returns the converted Elisp value, or nil for SQL NULL."
 
 (defun mysql--tls-available-p ()
   "Return non-nil if GnuTLS support is available in this Emacs."
-  (and (fboundp 'gnutls-available-p) (gnutls-available-p)))
+  (gnutls-available-p))
 
 (defun mysql--build-ssl-request (conn)
   "Build a 32-byte SSL_REQUEST packet for CONN."
@@ -1721,7 +1722,7 @@ Returns (string . new-pos)."
       (string-to-number (decode-coding-string value 'utf-8)))
      ((= type mysql-type-json)
       (let ((text (decode-coding-string value 'utf-8)))
-        (if (fboundp 'json-parse-string) (json-parse-string text) text)))
+        (json-parse-string text)))
      ((or (and character-set (= character-set mysql--binary-character-set))
           (not (zerop (logand flags mysql--column-flag-binary)))
           (= type mysql-type-geometry))
