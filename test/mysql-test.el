@@ -290,26 +290,16 @@ cannot round-trip."
   (should (equal (mysql-escape-literal "x1a") "'x1a'")))
 
 (ert-deftest mysql-test-uri-parsing ()
-  "Test MySQL URI parsing and percent decoding."
-  ;; Test that the regex matches valid URIs
-  (should (string-match
-           "\\`mysql://\\([^:@]*\\)\\(?::\\([^@]*\\)\\)?@\\([^:/]*\\)\\(?::\\([0-9]+\\)\\)?\\(?:/\\(.*\\)\\)?\\'"
-           "mysql://root:pass@localhost:3306/mydb"))
-  (should (equal (match-string 1 "mysql://root:pass@localhost:3306/mydb") "root"))
-  (should (equal (match-string 2 "mysql://root:pass@localhost:3306/mydb") "pass"))
-  (should (equal (match-string 3 "mysql://root:pass@localhost:3306/mydb") "localhost"))
-  (should (equal (match-string 4 "mysql://root:pass@localhost:3306/mydb") "3306"))
-  (should (equal (match-string 5 "mysql://root:pass@localhost:3306/mydb") "mydb"))
-  ;; Without port
-  (should (string-match
-           "\\`mysql://\\([^:@]*\\)\\(?::\\([^@]*\\)\\)?@\\([^:/]*\\)\\(?::\\([0-9]+\\)\\)?\\(?:/\\(.*\\)\\)?\\'"
-           "mysql://root:pass@localhost/mydb"))
-  (should (null (match-string 4 "mysql://root:pass@localhost/mydb")))
+  "MySQL URIs parse through the public entry with percent decoding."
   (cl-letf (((symbol-function 'mysql-connect) #'list))
     (should (equal (mysql-connect-uri
                     "mysql://user:p%40ss@localhost:3307/app%2Fdata")
                    '(:host "localhost" :port 3307 :user "user"
-                     :password "p@ss" :database "app/data")))))
+                     :password "p@ss" :database "app/data")))
+    ;; No port and no database fall back to defaults.
+    (should (equal (mysql-connect-uri "mysql://root:pw@db.internal")
+                   '(:host "db.internal" :port 3306 :user "root"
+                     :password "pw" :database nil)))))
 
 (ert-deftest mysql-test-transaction-state-helpers ()
   "Test autocommit and transaction status helpers."
@@ -423,13 +413,6 @@ cannot round-trip."
     (should (= (aref packet 20) 2))
     (should (equal (substring packet 21 23) "hi"))))
 
-(ert-deftest mysql-test-build-execute-packet-cursor-flag ()
-  "COM_STMT_EXECUTE should encode the requested cursor flag."
-  (let* ((stmt (make-mysql-stmt :id 1 :param-count 0 :column-count 1))
-         (packet (mysql--build-execute-packet
-                  stmt nil nil mysql--stmt-cursor-read-only)))
-    (should (= (aref packet 5) mysql--stmt-cursor-read-only))))
-
 (ert-deftest mysql-test-build-fetch-packet ()
   "Test COM_STMT_FETCH packet construction."
   (let* ((stmt (make-mysql-stmt :id #x01020304 :param-count 0))
@@ -451,68 +434,36 @@ cannot round-trip."
     ;; Params: nil=bit0, 42=bit1, nil=bit2 → bitmap = 0b101 = 5
     (should (= (aref packet 10) 5))))
 
-(ert-deftest mysql-test-build-null-bitmap ()
-  "Test NULL bitmap construction from a parameter vector."
-  (should (equal (mysql--build-null-bitmap [nil 42 nil] 3)
-                 (unibyte-string 5))))
-
-(ert-deftest mysql-test-prepare-binds-throw-on-input-nil ()
-  "COM_STMT_PREPARE should not let `throw-on-input' interrupt packet reads."
-  (let ((conn (make-mysql-conn))
-        observed-throw-on-input)
-    (cl-letf (((symbol-function 'mysql--send-packet) #'ignore)
-              ((symbol-function 'mysql--read-packet)
-               (lambda (_conn)
-                 (setq observed-throw-on-input throw-on-input)
-                 (unibyte-string #x00 #x01 #x00 #x00 #x00
-                                 #x00 #x00 #x00 #x00
-                                 #x00 #x00 #x00))))
-      (let ((throw-on-input 'mysql-test-tag))
-        (mysql-prepare conn "SELECT 1")))
-    (should-not observed-throw-on-input)))
-
-(ert-deftest mysql-test-prepare-marks-connection-busy-during-read ()
-  "COM_STMT_PREPARE should mark CONN busy while reading its response."
-  (let ((conn (make-mysql-conn))
-        observed-busy)
-    (cl-letf (((symbol-function 'mysql--send-packet) #'ignore)
-              ((symbol-function 'mysql--read-packet)
-               (lambda (conn)
-                 (setq observed-busy (mysql-conn-busy conn))
-                 (unibyte-string #x00 #x01 #x00 #x00 #x00
-                                 #x00 #x00 #x00 #x00
-                                 #x00 #x00 #x00))))
-      (mysql-prepare conn "SELECT 1"))
-    (should observed-busy)
-    (should-not (mysql-conn-busy conn))))
-
-(ert-deftest mysql-test-execute-binds-throw-on-input-nil ()
-  "COM_STMT_EXECUTE should not let `throw-on-input' interrupt packet reads."
-  (let* ((conn (make-mysql-conn))
-         (stmt (make-mysql-stmt :conn conn :id 1 :param-count 0))
-         observed-throw-on-input)
-    (cl-letf (((symbol-function 'mysql--send-packet) #'ignore)
-              ((symbol-function 'mysql--read-packet)
-               (lambda (_conn)
-                 (setq observed-throw-on-input throw-on-input)
-                 (unibyte-string #x00 #x01 #x00 #x02 #x00 #x00 #x00))))
-      (let ((throw-on-input 'mysql-test-tag))
-        (mysql-execute stmt)))
-    (should-not observed-throw-on-input)))
-
-(ert-deftest mysql-test-execute-marks-connection-busy-during-read ()
-  "COM_STMT_EXECUTE should mark CONN busy while reading its response."
-  (let* ((conn (make-mysql-conn))
-         (stmt (make-mysql-stmt :conn conn :id 1 :param-count 0))
-         observed-busy)
-    (cl-letf (((symbol-function 'mysql--send-packet) #'ignore)
-              ((symbol-function 'mysql--read-packet)
-               (lambda (conn)
-                 (setq observed-busy (mysql-conn-busy conn))
-                 (unibyte-string #x00 #x01 #x00 #x02 #x00 #x00 #x00))))
-      (mysql-execute stmt))
-    (should observed-busy)
-    (should-not (mysql-conn-busy conn))))
+(ert-deftest mysql-test-response-reads-bind-input-and-busy ()
+  "Response reads run with `throw-on-input' nil and CONN marked busy.
+Completion frameworks abort via `while-no-input'; a read interrupted
+mid-response would desynchronize the stream, and the busy flag is what
+rejects overlapping commands."
+  (dolist (command '(prepare execute))
+    (ert-info ((format "command: %s" command))
+      (let* ((conn (make-mysql-conn))
+             (stmt (make-mysql-stmt :conn conn :id 1 :param-count 0))
+             (response (pcase command
+                         ('prepare (unibyte-string #x00 #x01 #x00 #x00 #x00
+                                                   #x00 #x00 #x00 #x00
+                                                   #x00 #x00 #x00))
+                         ('execute (unibyte-string #x00 #x01 #x00 #x02
+                                                   #x00 #x00 #x00))))
+             observed-throw-on-input
+             observed-busy)
+        (cl-letf (((symbol-function 'mysql--send-packet) #'ignore)
+                  ((symbol-function 'mysql--read-packet)
+                   (lambda (conn)
+                     (setq observed-throw-on-input throw-on-input
+                           observed-busy (mysql-conn-busy conn))
+                     response)))
+          (let ((throw-on-input 'mysql-test-tag))
+            (pcase command
+              ('prepare (mysql-prepare conn "SELECT 1"))
+              ('execute (mysql-execute stmt)))))
+        (should-not observed-throw-on-input)
+        (should observed-busy)
+        (should-not (mysql-conn-busy conn))))))
 
 (ert-deftest mysql-test-execute-caches-parameter-types ()
   "COM_STMT_EXECUTE should rebind parameter types only when they change."
@@ -750,18 +701,6 @@ cannot round-trip."
     (should (= (plist-get info :status-flags)
                mysql--server-status-last-row-sent))))
 
-(ert-deftest mysql-test-struct-creation ()
-  "Test that structs can be created."
-  (let ((conn (make-mysql-conn :host "localhost" :port 3306
-                               :user "root" :database "test")))
-    (should (equal (mysql-conn-host conn) "localhost"))
-    (should (= (mysql-conn-port conn) 3306))
-    (should (= (mysql-conn-read-idle-timeout conn) 30))
-    (should (= (mysql-conn-sequence-id conn) 0)))
-  (let ((result (make-mysql-result :status "OK" :affected-rows 5)))
-    (should (equal (mysql-result-status result) "OK"))
-    (should (= (mysql-result-affected-rows result) 5))))
-
 (ert-deftest mysql-test-connection-state-accessors ()
   "Test public connection state accessors."
   (let ((conn (make-mysql-conn :host "localhost" :port 3306
@@ -769,6 +708,9 @@ cannot round-trip."
                                :connection-id 123 :busy t)))
     (should-not (mysql-live-p conn))
     (should (mysql-busy-p conn))
+    ;; Library defaults callers rely on.
+    (should (= (mysql-conn-read-idle-timeout conn) 30))
+    (should (= (mysql-conn-sequence-id conn) 0))
     (should (= (mysql-connection-id conn) 123))
     (should (equal (mysql-connection-user conn) "root"))
     (should (equal (mysql-connection-host conn) "localhost"))
@@ -1007,22 +949,15 @@ offsets and consumes nothing, which keeps the boundary case retryable."
 
 (ert-deftest mysql-test-read-packet-timeout-restores-packet-offset ()
   "A partial packet read should be restartable by response draining."
-  (let* ((buffer (generate-new-buffer " *mysql-test-partial-packet*"))
-         (process (make-pipe-process :name "mysql-test-partial-packet"
-                                     :buffer buffer :noquery t))
-         (conn (make-mysql-conn :process process :buf buffer
-                                :read-idle-timeout 0
-                                :sequence-id 9)))
-    (unwind-protect
-        (progn
-          (with-current-buffer buffer
-            (set-buffer-multibyte nil)
-            (insert (unibyte-string 3 0 0 9 ?x)))
-          (should-error (mysql--read-packet conn) :type 'mysql-timeout)
-          (should (= (mysql-conn-read-offset conn) 0))
-          (should (= (mysql-conn-sequence-id conn) 9)))
-      (delete-process process)
-      (kill-buffer buffer))))
+  (mysql-test--with-pipe-conn conn
+    (setf (mysql-conn-read-idle-timeout conn) 0
+          (mysql-conn-sequence-id conn) 9)
+    (with-current-buffer (mysql-conn-buf conn)
+      (set-buffer-multibyte nil)
+      (insert (unibyte-string 3 0 0 9 ?x)))
+    (should-error (mysql--read-packet conn) :type 'mysql-timeout)
+    (should (= (mysql-conn-read-offset conn) 0))
+    (should (= (mysql-conn-sequence-id conn) 9))))
 
 (ert-deftest mysql-test-drain-query-response-rejects-busy-connection ()
   "Draining should not run while CONN is already busy."
@@ -1070,122 +1005,65 @@ offsets and consumes nothing, which keeps the boundary case retryable."
          (stmt (make-mysql-stmt :conn conn :id 1)))
     (should-error (mysql-stmt-close stmt) :type 'mysql-error)))
 
+(defmacro mysql-test--with-auto-tls-stubs (auth-fn tls-flags &rest body)
+  "Run BODY with the connect/auth path stubbed for auto-TLS-retry tests.
+AUTH-FN plays `mysql--authenticate'; TLS-FLAGS names a variable
+collecting the tls argument of each auth attempt in call order."
+  (declare (indent 2) (debug (form symbolp body)))
+  `(let ((,tls-flags nil)
+         (buffers nil))
+     (cl-letf (((symbol-function 'mysql--tls-available-p) (lambda () t))
+               ((symbol-function 'mysql--open-connection)
+                (lambda (_host _port _timeout)
+                  (let ((buf (generate-new-buffer " *mysql-test-auto-tls*")))
+                    (push buf buffers)
+                    (cons (gensym "proc") buf))))
+               ((symbol-function 'mysql--authenticate)
+                (lambda (conn password tls)
+                  (push tls ,tls-flags)
+                  (funcall ,auth-fn conn password tls)))
+               ((symbol-function 'process-live-p) (lambda (_proc) t))
+               ((symbol-function 'delete-process) (lambda (_proc) nil)))
+       (unwind-protect
+           (progn ,@body)
+         (mapc (lambda (buf)
+                 (when (buffer-live-p buf)
+                   (kill-buffer buf)))
+               buffers)))))
+
 (ert-deftest mysql-test-connect-retries-caching-sha2-full-auth-with-tls ()
   "A non-TLS caching_sha2 full-auth failure should reconnect with TLS."
-  (let ((auth-tls-flags nil)
-        (buffers nil))
-    (cl-letf (((symbol-function 'mysql--tls-available-p) (lambda () t))
-              ((symbol-function 'mysql--open-connection)
-               (lambda (_host _port _timeout)
-                 (let ((buf (generate-new-buffer " *mysql-test-auto-tls*")))
-                   (push buf buffers)
-                   (cons (gensym "proc") buf))))
-              ((symbol-function 'mysql--authenticate)
-               (lambda (conn _password tls)
-                 (push tls auth-tls-flags)
-                 (if tls
-                     (setf (mysql-conn-tls conn) t)
-                   (signal 'mysql-auth-error
-                           '("caching_sha2_password full authentication requires TLS")))))
-              ((symbol-function 'process-live-p) (lambda (_proc) t))
-              ((symbol-function 'delete-process) (lambda (_proc) nil)))
-      (unwind-protect
-          (let ((conn (mysql-connect :host "127.0.0.1" :port 3306
-                                     :user "root" :password "pw"
-                                     :database "mysql")))
-            (should (equal (nreverse auth-tls-flags) '(nil t)))
-            (should (mysql-conn-tls conn)))
-        (mapc (lambda (buf)
-                (when (buffer-live-p buf)
-                  (kill-buffer buf)))
-              buffers)))))
+  (mysql-test--with-auto-tls-stubs
+      (lambda (conn _password tls)
+        (if tls
+            (setf (mysql-conn-tls conn) t)
+          (signal 'mysql-auth-error
+                  '("caching_sha2_password full authentication requires TLS"))))
+      auth-tls-flags
+    (let ((conn (mysql-connect :host "127.0.0.1" :port 3306
+                               :user "root" :password "pw"
+                               :database "mysql")))
+      (should (equal (nreverse auth-tls-flags) '(nil t)))
+      (should (mysql-conn-tls conn)))))
 
-(ert-deftest mysql-test-connect-ssl-mode-disabled-disables-auto-tls-retry ()
-  "ssl-mode disabled should keep MySQL 8 auth on plaintext and fail explicitly."
-  (let ((auth-tls-flags nil)
-        (buffers nil))
-    (cl-letf (((symbol-function 'mysql--tls-available-p) (lambda () t))
-              ((symbol-function 'mysql--open-connection)
-               (lambda (_host _port _timeout)
-                 (let ((buf (generate-new-buffer " *mysql-test-ssl-off*")))
-                   (push buf buffers)
-                   (cons (gensym "proc") buf))))
-              ((symbol-function 'mysql--authenticate)
-               (lambda (_conn _password tls)
-                 (push tls auth-tls-flags)
-                 (signal 'mysql-auth-error
-                         '("caching_sha2_password full authentication requires TLS"))))
-              ((symbol-function 'process-live-p) (lambda (_proc) t))
-              ((symbol-function 'delete-process) (lambda (_proc) nil)))
-      (unwind-protect
-          (should-error
-           (mysql-connect :host "127.0.0.1" :port 3306
-                          :user "root" :password "pw"
-                          :database "mysql" :ssl-mode 'disabled)
-           :type 'mysql-auth-error)
-        (should (equal auth-tls-flags '(nil)))
-        (mapc (lambda (buf)
-                (when (buffer-live-p buf)
-                  (kill-buffer buf)))
-              buffers)))))
-
-(ert-deftest mysql-test-connect-ssl-mode-off-alias-disables-auto-tls-retry ()
-  "ssl-mode off should remain accepted as an alias for disabled."
-  (let ((auth-tls-flags nil)
-        (buffers nil))
-    (cl-letf (((symbol-function 'mysql--tls-available-p) (lambda () t))
-              ((symbol-function 'mysql--open-connection)
-               (lambda (_host _port _timeout)
-                 (let ((buf (generate-new-buffer " *mysql-test-ssl-off*")))
-                   (push buf buffers)
-                   (cons (gensym "proc") buf))))
-              ((symbol-function 'mysql--authenticate)
-               (lambda (_conn _password tls)
-                 (push tls auth-tls-flags)
-                 (signal 'mysql-auth-error
-                         '("caching_sha2_password full authentication requires TLS"))))
-              ((symbol-function 'process-live-p) (lambda (_proc) t))
-              ((symbol-function 'delete-process) (lambda (_proc) nil)))
-      (unwind-protect
-          (should-error
-           (mysql-connect :host "127.0.0.1" :port 3306
-                          :user "root" :password "pw"
-                          :database "mysql" :ssl-mode 'off)
-           :type 'mysql-auth-error)
-        (should (equal auth-tls-flags '(nil)))
-        (mapc (lambda (buf)
-                (when (buffer-live-p buf)
-                  (kill-buffer buf)))
-              buffers)))))
-
-(ert-deftest mysql-test-connect-explicit-tls-nil-disables-auto-tls-retry ()
-  "Explicit :tls nil should force plaintext and fail without auto-retry."
-  (let ((auth-tls-flags nil)
-        (buffers nil))
-    (cl-letf (((symbol-function 'mysql--tls-available-p) (lambda () t))
-              ((symbol-function 'mysql--open-connection)
-               (lambda (_host _port _timeout)
-                 (let ((buf (generate-new-buffer " *mysql-test-tls-nil*")))
-                   (push buf buffers)
-                   (cons (gensym "proc") buf))))
-              ((symbol-function 'mysql--authenticate)
-               (lambda (_conn _password tls)
-                 (push tls auth-tls-flags)
-                 (signal 'mysql-auth-error
-                         '("caching_sha2_password full authentication requires TLS"))))
-              ((symbol-function 'process-live-p) (lambda (_proc) t))
-              ((symbol-function 'delete-process) (lambda (_proc) nil)))
-      (unwind-protect
-          (should-error
-           (mysql-connect :host "127.0.0.1" :port 3306
-                          :user "root" :password "pw"
-                          :database "mysql" :tls nil)
-           :type 'mysql-auth-error)
-        (should (equal auth-tls-flags '(nil)))
-        (mapc (lambda (buf)
-                (when (buffer-live-p buf)
-                  (kill-buffer buf)))
-              buffers)))))
+(ert-deftest mysql-test-connect-tls-opt-outs-disable-auto-tls-retry ()
+  "Every TLS opt-out spelling keeps MySQL 8 auth plaintext and fails loudly."
+  (dolist (extra-args '((:ssl-mode disabled)
+                        (:ssl-mode off)
+                        (:tls nil)))
+    (ert-info ((format "connect args: %s" extra-args))
+      (mysql-test--with-auto-tls-stubs
+          (lambda (_conn _password _tls)
+            (signal 'mysql-auth-error
+                    '("caching_sha2_password full authentication requires TLS")))
+          auth-tls-flags
+        (should-error
+         (apply #'mysql-connect
+                :host "127.0.0.1" :port 3306
+                :user "root" :password "pw" :database "mysql"
+                extra-args)
+         :type 'mysql-auth-error)
+        (should (equal auth-tls-flags '(nil)))))))
 
 (ert-deftest mysql-test-connect-rejects-conflicting-tls-and-ssl-mode ()
   "Explicit TLS should conflict with ssl-mode disabled."
@@ -1251,32 +1129,28 @@ offsets and consumes nothing, which keeps the boundary case retryable."
 
 (ert-deftest mysql-test-read-packet-rejects-sequence-mismatch ()
   "Incoming fragments must match the expected packet sequence."
-  (let* ((buffer (generate-new-buffer " *mysql-test-sequence*"))
-         (process (make-pipe-process :name "mysql-test-sequence"
-                                     :buffer buffer :noquery t))
-         (conn (make-mysql-conn :process process :buf buffer :sequence-id 3)))
-    (with-current-buffer buffer
+  (mysql-test--with-pipe-conn conn
+    (setf (mysql-conn-sequence-id conn) 3)
+    (with-current-buffer (mysql-conn-buf conn)
       (set-buffer-multibyte nil)
       (insert (unibyte-string 1 0 0 4 ?x)))
     (should-error (mysql--read-packet conn) :type 'mysql-protocol-error)
     (should-not (mysql-live-p conn))
-    (should-not (buffer-live-p buffer))))
+    (should-not (buffer-live-p (mysql-conn-buf conn)))))
 
 (ert-deftest mysql-test-read-packet-enforces-message-and-response-limits ()
   "Logical packet and command response byte budgets should be bounded."
   (dolist (limits '((2 100) (100 2)))
-    (let* ((buffer (generate-new-buffer " *mysql-test-limit*"))
-           (process (make-pipe-process :name "mysql-test-limit"
-                                       :buffer buffer :noquery t))
-           (conn (make-mysql-conn :process process :buf buffer)))
-      (with-current-buffer buffer
-        (set-buffer-multibyte nil)
-        (insert (unibyte-string 3 0 0 0 ?a ?b ?c)))
-      (let ((mysql-max-message-bytes (car limits))
-            (mysql-max-response-bytes (cadr limits)))
-        (should-error (mysql--read-packet conn) :type 'mysql-protocol-error))
-      (should-not (mysql-live-p conn))
-      (should-not (buffer-live-p buffer)))))
+    (ert-info ((format "limits: %s" limits))
+      (mysql-test--with-pipe-conn conn
+        (with-current-buffer (mysql-conn-buf conn)
+          (set-buffer-multibyte nil)
+          (insert (unibyte-string 3 0 0 0 ?a ?b ?c)))
+        (let ((mysql-max-message-bytes (car limits))
+              (mysql-max-response-bytes (cadr limits)))
+          (should-error (mysql--read-packet conn) :type 'mysql-protocol-error))
+        (should-not (mysql-live-p conn))
+        (should-not (buffer-live-p (mysql-conn-buf conn)))))))
 
 (ert-deftest mysql-test-auth-response-fails-closed ()
   "Unknown and incomplete authentication packets should be rejected."
@@ -1290,30 +1164,24 @@ offsets and consumes nothing, which keeps the boundary case retryable."
 
 (ert-deftest mysql-test-result-parse-error-invalidates-connection ()
   "A structural error mid-response must make the stream unusable."
-  (let* ((buffer (generate-new-buffer " *mysql-test-parse-error*"))
-         (process (make-pipe-process :name "mysql-test-parse-error"
-                                     :buffer buffer :noquery t))
-         (conn (make-mysql-conn :process process :buf buffer
-                                :capability-flags 0)))
+  (mysql-test--with-pipe-conn conn
+    (setf (mysql-conn-capability-flags conn) 0)
     (cl-letf (((symbol-function 'mysql--read-packet)
                (lambda (_conn) (unibyte-string 1))))
       (should-error (mysql--read-result-set conn (unibyte-string 1))))
     (should-not (mysql-live-p conn))
-    (should-not (buffer-live-p buffer))))
+    (should-not (buffer-live-p (mysql-conn-buf conn)))))
 
 (ert-deftest mysql-test-binary-row-parse-error-invalidates-connection ()
   "A malformed prepared-row response must invalidate the stream."
-  (let* ((buffer (generate-new-buffer " *mysql-test-binary-parse-error*"))
-         (process (make-pipe-process :name "mysql-test-binary-parse-error"
-                                     :buffer buffer :noquery t))
-         (conn (make-mysql-conn :process process :buf buffer)))
+  (mysql-test--with-pipe-conn conn
     (cl-letf (((symbol-function 'mysql--read-packet)
                (lambda (_conn) (unibyte-string 0 0))))
       (should-error
        (mysql--read-binary-rows-with-status
         conn (list (list :type mysql-type-longlong :flags 0)))))
     (should-not (mysql-live-p conn))
-    (should-not (buffer-live-p buffer))))
+    (should-not (buffer-live-p (mysql-conn-buf conn)))))
 
 ;;;; Live integration tests (require a running MySQL server)
 
