@@ -278,6 +278,13 @@ COMMAND-NAME is used in the busy-connection error message."
             (prog1 (let ((throw-on-input nil))
                      (funcall fn))
               (setq completed t))
+          ;; Query and statement errors are signaled only after the ERR
+          ;; or OK packet that carries them is fully consumed, so the
+          ;; stream sits at a response boundary and the connection stays
+          ;; usable.
+          ((mysql-query-error mysql-stmt-error)
+           (setq handled t)
+           (signal (car err) (cdr err)))
           (mysql-timeout
            (setq handled t)
            (mysql--handle-command-interruption conn)
@@ -286,9 +293,10 @@ COMMAND-NAME is used in the busy-connection error message."
            (setq handled t)
            (mysql--handle-command-interruption conn)
            (signal (car err) (cdr err))))
-      (when (and (not completed)
-                 (not handled)
-                 (mysql-conn-response-drainable conn))
+      ;; Any other unfinished exit -- a throw, or an error class that
+      ;; does not imply a synchronized stream -- goes through the same
+      ;; interruption decision: preserve at a boundary, close mid-parse.
+      (when (and (not completed) (not handled))
         (mysql--handle-command-interruption conn))
       (setf (mysql-conn-busy conn) nil))))
 
@@ -1238,6 +1246,7 @@ has no pending response, or cannot consume the response completely."
   (unless (mysql-conn-response-pending conn)
     (signal 'mysql-error (list "Connection has no pending query response")))
   (let ((old-timeout (mysql-conn-read-idle-timeout conn))
+        (start-bytes (mysql-conn-response-bytes conn))
         synchronized)
     (unwind-protect
         (condition-case err
@@ -1252,8 +1261,16 @@ has no pending response, or cannot consume the response completely."
            (setq synchronized t)
            (signal (car err) (cdr err))))
       (setf (mysql-conn-busy conn) nil)
-      (when synchronized
-        (setf (mysql-conn-response-pending conn) nil))
+      (if synchronized
+          (setf (mysql-conn-response-pending conn) nil)
+        ;; An exit part-way through the pending response cannot be
+        ;; retried: consumed packets are gone, so a second drain would
+        ;; read the remainder as a fresh response.  A partial packet
+        ;; read restores its offsets and consumes nothing, so an
+        ;; unchanged byte count means the boundary drain can be retried.
+        (when (/= (mysql-conn-response-bytes conn) start-bytes)
+          (mysql--cleanup-connection-resources
+           (mysql-conn-process conn) (mysql-conn-buf conn))))
       (setf (mysql-conn-read-idle-timeout conn) old-timeout))))
 
 (defun mysql--read-column-definitions (conn col-count)
