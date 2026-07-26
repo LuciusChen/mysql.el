@@ -900,181 +900,110 @@ cannot round-trip."
      :type 'mysql-error)
     (should-not called)))
 
-(ert-deftest mysql-test-nondrainable-timeout-closes-connection ()
-  "A timeout after response parsing starts should close CONN."
-  (let* ((buffer (generate-new-buffer " *mysql-test-nondrainable*"))
-         (process (make-pipe-process :name "mysql-test-nondrainable"
-                                     :buffer buffer :noquery t))
-         (conn (make-mysql-conn :process process :buf buffer)))
-    (should-error
-     (mysql--run-command-response
-      conn "query" (lambda () (signal 'mysql-timeout '("timed out"))))
-     :type 'mysql-timeout)
-    (should-not (mysql-live-p conn))
-    (should-not (buffer-live-p buffer))
-    (should-not (mysql-conn-response-pending conn))))
+(defmacro mysql-test--with-pipe-conn (var &rest body)
+  "Run BODY with VAR bound to a `mysql-conn' over a fresh pipe process.
+The process and its buffer are cleaned up afterwards."
+  (declare (indent 1) (debug (symbolp body)))
+  (let ((buf (make-symbol "buffer"))
+        (proc (make-symbol "process")))
+    `(let* ((,buf (generate-new-buffer " *mysql-test-conn*"))
+            (,proc (make-pipe-process :name "mysql-test-conn"
+                                      :buffer ,buf :noquery t))
+            (,var (make-mysql-conn :process ,proc :buf ,buf)))
+       (unwind-protect
+           (progn ,@body)
+         (when (process-live-p ,proc)
+           (delete-process ,proc))
+         (when (buffer-live-p ,buf)
+           (kill-buffer ,buf))))))
 
-(ert-deftest mysql-test-mid-response-quit-closes-connection ()
-  "A quit after response parsing has begun must close CONN, not keep it.
-Once packets of the response are consumed the stream sits mid-response,
-and a later drain would parse a row as a response header; a row whose
-first byte is zero reads as OK and leaves the remaining rows for the
-next command's reader."
-  (let* ((buffer (generate-new-buffer " *mysql-test-mid-response-quit*"))
-         (process (make-pipe-process :name "mysql-test-mid-response-quit"
-                                     :buffer buffer :noquery t))
-         (conn (make-mysql-conn :process process :buf buffer)))
-    (unwind-protect
-        (let (caught)
-          ;; `should-error' does not catch quit, so trap it explicitly.
-          (condition-case nil
-              (mysql--run-command-response
-               conn "query"
-               (lambda ()
-                 ;; The first response packet has been consumed, so the
-                 ;; drainable window is over.
-                 (setf (mysql-conn-response-drainable conn) nil)
-                 (signal 'quit nil)))
-            (quit (setq caught t)))
-          (should caught)
-          (should-not (mysql-live-p conn))
-          (should-not (buffer-live-p buffer))
-          (should-not (mysql-conn-response-pending conn)))
-      (when (process-live-p process)
-        (delete-process process))
-      (when (buffer-live-p buffer)
-        (kill-buffer buffer)))))
+(ert-deftest mysql-test-command-interruption-matrix ()
+  "Every command abandonment closes or preserves by where the stream stopped.
+A boundary exit -- nothing of the response consumed yet -- preserves the
+connection for the out-of-band cancel-and-drain path.  A mid-response
+exit closes it: the stream position is inside the response, and a later
+drain would read a row as a response header.  Query and statement
+errors are boundary by construction, since their ERR or OK packet is
+fully consumed before the signal, so they keep the connection usable
+without a pending drain."
+  (dolist (case '((timeout     t   preserve)
+                  (timeout     nil close)
+                  (quit        t   preserve)
+                  (quit        nil close)
+                  (throw       t   preserve)
+                  (throw       nil close)
+                  (query-error nil usable)
+                  (stmt-error  nil usable)))
+    (pcase-let ((`(,exit ,drainable ,expected) case))
+      (ert-info ((format "exit: %s drainable: %s" exit drainable))
+        (mysql-test--with-pipe-conn conn
+          (let ((run (lambda ()
+                       (mysql--run-command-response
+                        conn "query"
+                        (lambda ()
+                          (setf (mysql-conn-response-drainable conn)
+                                drainable)
+                          (pcase exit
+                            ('timeout (signal 'mysql-timeout '("timed out")))
+                            ('quit (signal 'quit nil))
+                            ('throw (throw 'mysql-test-exit :aborted))
+                            ('query-error
+                             (signal 'mysql-query-error '("[1064] boom")))
+                            ('stmt-error
+                             (signal 'mysql-stmt-error '("[1210] boom")))))))))
+            (pcase exit
+              ('quit
+               (let (caught)
+                 (condition-case nil (funcall run) (quit (setq caught t)))
+                 (should caught)))
+              ('throw
+               (should (eq (catch 'mysql-test-exit (funcall run)) :aborted)))
+              (_
+               (should-error (funcall run)
+                             :type (pcase exit
+                                     ('timeout 'mysql-timeout)
+                                     ('query-error 'mysql-query-error)
+                                     ('stmt-error 'mysql-stmt-error))))))
+          (should-not (mysql-conn-busy conn))
+          (pcase expected
+            ('preserve
+             (should (mysql-live-p conn))
+             (should (mysql-conn-response-pending conn)))
+            ('close
+             (should-not (mysql-live-p conn))
+             (should-not (buffer-live-p (mysql-conn-buf conn)))
+             (should-not (mysql-conn-response-pending conn)))
+            ('usable
+             (should (mysql-live-p conn))
+             (should-not (mysql-conn-response-pending conn)))))))))
 
-(ert-deftest mysql-test-mid-response-throw-closes-connection ()
-  "A nonlocal throw after response parsing has begun must close CONN.
-Quit and timeout already closed mid-response connections, but a plain
-throw slipped past the old drainable-only cleanup guard, leaving a
-desynchronized connection whose next command would read the previous
-response as its own."
-  (let* ((buffer (generate-new-buffer " *mysql-test-mid-response-throw*"))
-         (process (make-pipe-process :name "mysql-test-mid-response-throw"
-                                     :buffer buffer :noquery t))
-         (conn (make-mysql-conn :process process :buf buffer)))
-    (unwind-protect
-        (progn
-          (should
-           (eq (catch 'mysql-test-throw
-                 (mysql--run-command-response
-                  conn "query"
-                  (lambda ()
-                    ;; The first response packet has been consumed.
-                    (setf (mysql-conn-response-drainable conn) nil)
-                    (throw 'mysql-test-throw :aborted))))
-               :aborted))
-          (should-not (mysql-live-p conn))
-          (should-not (buffer-live-p buffer))
-          (should-not (mysql-conn-response-pending conn)))
-      (when (process-live-p process)
-        (delete-process process))
-      (when (buffer-live-p buffer)
-        (kill-buffer buffer)))))
-
-(ert-deftest mysql-test-query-error-keeps-connection-usable ()
-  "A SQL error must not close the connection.
-Query and statement errors are signaled only after their ERR packet is
-fully consumed, so the stream sits at a response boundary."
-  (dolist (error-symbol '(mysql-query-error mysql-stmt-error))
-    (ert-info ((format "error: %s" error-symbol))
-      (let* ((buffer (generate-new-buffer " *mysql-test-query-error*"))
-             (process (make-pipe-process :name "mysql-test-query-error"
-                                         :buffer buffer :noquery t))
-             (conn (make-mysql-conn :process process :buf buffer)))
-        (unwind-protect
-            (progn
-              (should-error
-               (mysql--run-command-response
-                conn "query"
-                (lambda ()
-                  (setf (mysql-conn-response-drainable conn) nil)
-                  (signal error-symbol '("[1064] syntax error"))))
-               :type error-symbol)
-              (should (mysql-live-p conn))
-              (should (buffer-live-p buffer))
-              (should-not (mysql-conn-busy conn))
-              (should-not (mysql-conn-response-pending conn)))
-          (when (process-live-p process)
-            (delete-process process))
-          (when (buffer-live-p buffer)
-            (kill-buffer buffer)))))))
-
-(ert-deftest mysql-test-drain-quit-mid-response-closes-connection ()
-  "A quit part-way through a drain must close CONN instead of retrying.
-Consumed packets are gone; a second drain would read the remainder of
-the pending response as a fresh one."
-  (let* ((buffer (generate-new-buffer " *mysql-test-drain-quit*"))
-         (process (make-pipe-process :name "mysql-test-drain-quit"
-                                     :buffer buffer :noquery t))
-         (conn (make-mysql-conn :process process :buf buffer
-                                :response-pending t))
-         caught)
-    (unwind-protect
-        (progn
-          (cl-letf (((symbol-function 'mysql--read-packet)
-                     (lambda (conn)
-                       ;; One packet of the response was consumed before
-                       ;; the quit arrived.
-                       (cl-incf (mysql-conn-response-bytes conn) 9)
-                       (signal 'quit nil))))
-            (condition-case nil
-                (mysql-drain-query-response conn)
-              (quit (setq caught t))))
-          (should caught)
-          (should-not (mysql-live-p conn))
-          (should-not (buffer-live-p buffer))
-          ;; The boundary case consumes nothing and stays retryable.
-          (let* ((buffer2 (generate-new-buffer " *mysql-test-drain-quit-2*"))
-                 (process2 (make-pipe-process :name "mysql-test-drain-quit-2"
-                                              :buffer buffer2 :noquery t))
-                 (conn2 (make-mysql-conn :process process2 :buf buffer2
-                                         :response-pending t))
-                 caught2)
-            (unwind-protect
-                (progn
-                  (cl-letf (((symbol-function 'mysql--read-packet)
-                             (lambda (_conn) (signal 'quit nil))))
-                    (condition-case nil
-                        (mysql-drain-query-response conn2)
-                      (quit (setq caught2 t))))
-                  (should caught2)
-                  (should (mysql-live-p conn2))
-                  (should (mysql-conn-response-pending conn2)))
-              (when (process-live-p process2)
-                (delete-process process2))
-              (when (buffer-live-p buffer2)
-                (kill-buffer buffer2)))))
-      (when (process-live-p process)
-        (delete-process process))
-      (when (buffer-live-p buffer)
-        (kill-buffer buffer)))))
-
-(ert-deftest mysql-test-active-nonlocal-exit-preserves-response-for-drain ()
-  "A nonlocal exit during a drainable query should leave CONN drainable."
-  (let* ((buffer (generate-new-buffer " *mysql-test-active-quit*"))
-         (process (make-pipe-process :name "mysql-test-active-quit"
-                                     :buffer buffer :noquery t))
-         (conn (make-mysql-conn :process process :buf buffer)))
-    (unwind-protect
-        (progn
-          (should
-           (eq (catch 'mysql-test-active-exit
-                 (mysql--run-command-response
-                  conn "query"
-                  (lambda ()
-                    (setf (mysql-conn-response-drainable conn) t)
-                    (throw 'mysql-test-active-exit :quit))))
-               :quit))
-          (should (mysql-live-p conn))
-          (should (buffer-live-p buffer))
-          (should (mysql-conn-response-pending conn)))
-      (when (process-live-p process)
-        (delete-process process))
-      (when (buffer-live-p buffer)
-        (kill-buffer buffer)))))
+(ert-deftest mysql-test-drain-interruption-follows-consumption ()
+  "A drain abandoned mid-response closes CONN; at the boundary it retries.
+Consumed packets are gone, so a second drain would read the remainder of
+the pending response as a fresh one; a partial packet read restores its
+offsets and consumes nothing, which keeps the boundary case retryable."
+  (dolist (case '((consumed close) (boundary retry)))
+    (pcase-let ((`(,progress ,expected) case))
+      (ert-info ((format "progress: %s" progress))
+        (mysql-test--with-pipe-conn conn
+          (setf (mysql-conn-response-pending conn) t)
+          (let (caught)
+            (cl-letf (((symbol-function 'mysql--read-packet)
+                       (lambda (conn)
+                         (when (eq progress 'consumed)
+                           (cl-incf (mysql-conn-response-bytes conn) 9))
+                         (signal 'quit nil))))
+              (condition-case nil
+                  (mysql-drain-query-response conn)
+                (quit (setq caught t))))
+            (should caught))
+          (pcase expected
+            ('close
+             (should-not (mysql-live-p conn))
+             (should-not (buffer-live-p (mysql-conn-buf conn))))
+            ('retry
+             (should (mysql-live-p conn))
+             (should (mysql-conn-response-pending conn)))))))))
 
 (ert-deftest mysql-test-read-packet-timeout-restores-packet-offset ()
   "A partial packet read should be restartable by response draining."
