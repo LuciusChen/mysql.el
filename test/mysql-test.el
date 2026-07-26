@@ -245,7 +245,13 @@
   (should (equal (mysql-escape-literal "hello") "'hello'"))
   (should (equal (mysql-escape-literal "it's") "'it\\'s'"))
   (should (equal (mysql-escape-literal "line\nbreak") "'line\\nbreak'"))
-  (should (equal (mysql-escape-literal "back\\slash") "'back\\\\slash'")))
+  (should (equal (mysql-escape-literal "back\\slash") "'back\\\\slash'"))
+  ;; Ctrl-Z terminates a statement for the Windows client and must not reach
+  ;; the server raw.
+  (should (equal (mysql-escape-literal (concat "a" (string ?\C-z) "b"))
+                 "'a\\Zb'"))
+  ;; The escape set must not capture the letters spelling its own hex escape.
+  (should (equal (mysql-escape-literal "x1a") "'x1a'")))
 
 (ert-deftest mysql-test-uri-parsing ()
   "Test MySQL URI parsing and percent decoding."

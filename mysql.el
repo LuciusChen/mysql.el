@@ -1970,7 +1970,7 @@ updated after the server accepts the `USE' command."
 Wraps in single quotes and escapes special characters."
   (concat "'"
           (replace-regexp-in-string
-           "[\0\n\r\\\\'\"\\x1a]"
+           "[\0\n\r\\\\'\"\C-z]"
            (lambda (ch)
              (pcase ch
                ("\0"   "\\0")
@@ -1979,7 +1979,7 @@ Wraps in single quotes and escapes special characters."
                ("\\"   "\\\\")
                ("'"    "\\'")
                ("\""   "\\\"")
-               ("\x1a" "\\Z")
+               ("\C-z" "\\Z")
                (_ ch)))
            value nil t)
           "'"))
