@@ -19,11 +19,22 @@
 - Use `mysql-error` and its subtypes for error signaling; do not swallow errors.
 - Error messages should describe the current problem, not issue command-style requirements.
 - For MELPA naming compliance, all library symbols must use the `mysql-` prefix.
-- Run tests with:
+- Run tests with (`load-prefer-newer` keeps a stale `.elc` from shadowing
+  edited sources):
 
 ```bash
-emacs -batch -L . -l ert -l test/mysql-test.el \
+emacs -Q --batch --eval '(setq load-prefer-newer t)' \
+  -L . -l ert -l test/mysql-test.el \
   --eval '(ert-run-tests-batch-and-exit)'
+```
+
+- Byte-compile with zero warnings, then delete the generated files so they
+  cannot shadow the source in later runs:
+
+```bash
+emacs -Q --batch --eval '(setq byte-compile-error-on-warn t)' \
+  -L . -f batch-byte-compile mysql.el test/mysql-test.el \
+  && rm -f *.elc test/*.elc
 ```
 
 - Run package-lint with:

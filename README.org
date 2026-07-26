@@ -27,14 +27,14 @@ classic MySQL protocol directly and does not shell out to the =mysql= CLI.
 #+begin_src emacs-lisp
 (require 'mysql)
 
-(let* ((conn (mysql-connect :host "127.0.0.1"
-                                 :port 3306
-                                 :user "root"
-                                 :password "secret"
-                                 :database "mydb"))
-       (result (mysql-query conn "SELECT 1 AS n")))
+(let ((conn (mysql-connect :host "127.0.0.1"
+                           :port 3306
+                           :user "root"
+                           :password "secret"
+                           :database "mydb")))
   (unwind-protect
-      (message "Rows: %S" (mysql-result-rows result))
+      (let ((result (mysql-query conn "SELECT 1 AS n")))
+        (message "Rows: %S" (mysql-result-rows result)))
     (mysql-disconnect conn)))
 #+end_src
 

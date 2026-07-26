@@ -11,13 +11,20 @@
 ;; Tests marked with :mysql-live require a running MySQL instance:
 ;;   docker run -e MYSQL_ROOT_PASSWORD=test -p 3306:3306 mysql:8
 ;;
-;; Run all unit tests:
-;;   emacs -batch -L .. -l ert -l mysql-test -f ert-run-tests-batch-and-exit
+;; Run all unit tests from the repository root; `load-prefer-newer'
+;; keeps a stale .elc from shadowing edited sources:
+;;   emacs -Q --batch --eval '(setq load-prefer-newer t)' \
+;;     -L . -l ert -l test/mysql-test.el \
+;;     --eval '(ert-run-tests-batch-and-exit)'
 ;;
-;; Run live integration tests:
-;;   emacs -batch -L .. -l ert -l mysql-test \
-;;     --eval '(setq mysql-test-password "test")' \
-;;     -f ert-run-tests-batch-and-exit
+;; Run live integration tests; the TLS-tagged tests stay skipped unless
+;; `mysql-test-tls-enabled' is also set (the docker image above serves
+;; TLS out of the box):
+;;   emacs -Q --batch --eval '(setq load-prefer-newer t)' \
+;;     -L . -l ert -l test/mysql-test.el \
+;;     --eval '(setq mysql-test-password "test"
+;;                   mysql-test-tls-enabled t)' \
+;;     --eval '(ert-run-tests-batch-and-exit)'
 
 ;;; Code:
 
