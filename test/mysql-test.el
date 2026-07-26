@@ -972,20 +972,25 @@ offsets and consumes nothing, which keeps the boundary case retryable."
                 :type 'mysql-error))
 
 (ert-deftest mysql-test-open-connection-does-not-force-plain-type ()
-  "Opening a MySQL socket should not force an unsupported process type."
-  (let (captured-args)
+  "Socket setup should not force a process type and must install the sentinel."
+  (let (captured-args installed-sentinel)
     (cl-letf (((symbol-function 'make-network-process)
                (lambda (&rest args)
                  (setq captured-args args)
                  'fake-proc))
               ((symbol-function 'set-process-coding-system) #'ignore)
               ((symbol-function 'set-process-filter) #'ignore)
+              ((symbol-function 'set-process-sentinel)
+               (lambda (_proc sentinel)
+                 (setq installed-sentinel sentinel)))
               ((symbol-function 'mysql--wait-for-connect) #'ignore))
       (pcase-let ((`(,proc . ,buf) (mysql--open-connection "127.0.0.1" 3306 10)))
         (unwind-protect
             (progn
               (should (eq proc 'fake-proc))
-              (should-not (plist-member captured-args :type)))
+              (should-not (plist-member captured-args :type))
+              ;; The wire-safe sentinel keeps close events out of the buffer.
+              (should (eq installed-sentinel #'mysql--process-sentinel)))
           (kill-buffer buf))))))
 
 (ert-deftest mysql-test-open-connection-cleans-buffer-on-create-error ()
@@ -1137,6 +1142,32 @@ collecting the tls argument of each auth attempt in call order."
     (should-error (mysql--read-packet conn) :type 'mysql-protocol-error)
     (should-not (mysql-live-p conn))
     (should-not (buffer-live-p (mysql-conn-buf conn)))))
+
+(ert-deftest mysql-test-remote-close-keeps-final-err-packet-readable ()
+  "A peer close must not corrupt an ERR packet buffered just before it.
+MySQL sends its last ERR -- Access denied, shutdown -- and closes; the
+default sentinel would insert its event text at the process mark, ahead
+of those bytes, and the parser would read prose as a packet header."
+  (mysql-test--with-pipe-conn conn
+    (let ((proc (mysql-conn-process conn))
+          (payload (concat (unibyte-string #xff #x15 #x04) "#28000"
+                           "Access denied")))
+      (set-process-sentinel proc #'mysql--process-sentinel)
+      (setf (mysql-conn-sequence-id conn) 2)
+      (with-current-buffer (mysql-conn-buf conn)
+        (set-buffer-multibyte nil)
+        (insert (mysql--int-le-bytes (length payload) 3)
+                (unibyte-string 2)
+                payload))
+      ;; The remote peer closes after sending its final packet.
+      (delete-process proc)
+      (accept-process-output nil 0.05)
+      (should (process-get proc 'mysql-error))
+      (let ((packet (mysql--read-packet conn)))
+        (should (eq (mysql--packet-type packet) 'err))
+        (let ((err (mysql--parse-err-packet packet)))
+          (should (= (plist-get err :code) 1045))
+          (should (equal (plist-get err :message) "Access denied")))))))
 
 (ert-deftest mysql-test-read-packet-enforces-message-and-response-limits ()
   "Logical packet and command response byte budgets should be bounded."

@@ -1023,6 +1023,15 @@ PASSWORD is the plaintext password; TLS non-nil means upgrade to TLS first."
       (signal 'mysql-connection-error
               (list (format "Failed to connect to %s:%s" host port))))))
 
+(defun mysql--process-sentinel (process event)
+  "Record MySQL PROCESS termination EVENT without touching its wire buffer.
+The default sentinel inserts EVENT text into the process buffer at the
+process mark -- ahead of any unread server bytes -- so a final ERR
+packet sent just before the peer closed would parse as prose instead
+of protocol data."
+  (unless (process-live-p process)
+    (process-put process 'mysql-error (string-trim event))))
+
 (defun mysql--open-connection (host port &optional connect-timeout)
   "Open a raw TCP connection to HOST:PORT for MySQL.
 CONNECT-TIMEOUT, when non-nil, limits the initial socket connect.
@@ -1046,6 +1055,9 @@ Returns (PROCESS . BUFFER)."
                                 (with-current-buffer buf
                                   (goto-char (point-max))
                                   (insert data))))
+          ;; The filter never advances the process mark, so the default
+          ;; sentinel would insert close events before unread wire bytes.
+          (set-process-sentinel proc #'mysql--process-sentinel)
           (mysql--wait-for-connect proc host port connect-timeout)
           (setq opened t)
           (cons proc buf))
