@@ -177,6 +177,42 @@
   (should (equal (mysql--parse-value "hello" mysql-type-var-string) "hello"))
   (should (null (mysql--parse-value nil mysql-type-long))))
 
+(ert-deftest mysql-test-parse-value-decimal-stays-exact ()
+  "DECIMAL survives as its exact digit string in both protocols.
+The type exists to keep values a float cannot represent."
+  (let ((digits "1234567890123456789.123456789"))
+    (should (equal (mysql--parse-value digits mysql-type-newdecimal) digits))
+    (should (equal (mysql--parse-value digits mysql-type-decimal) digits))
+    (should (equal (mysql--binary-text-value
+                    digits (list :type mysql-type-newdecimal))
+                   digits))))
+
+(ert-deftest mysql-test-parse-value-binary-columns-keep-bytes ()
+  "Text protocol string decoding must follow the column's character set.
+A BLOB decoded as UTF-8 corrupts bytes that are not valid sequences and
+cannot round-trip."
+  (let ((bytes (unibyte-string #xff #x00 #xfe #x80)))
+    ;; Binary character set: bytes come back untouched.
+    (should (equal (mysql--parse-value
+                    bytes (list :type mysql-type-blob
+                                :character-set mysql--binary-character-set
+                                :flags mysql--column-flag-binary))
+                   bytes))
+    ;; GEOMETRY is bytes regardless of metadata beyond its type.
+    (should (equal (mysql--parse-value
+                    bytes (list :type mysql-type-geometry))
+                   bytes))
+    ;; A text column still decodes.
+    (should (equal (mysql--parse-value
+                    (encode-coding-string "héllo" 'utf-8)
+                    (list :type mysql-type-var-string :character-set 224))
+                   "héllo"))
+    ;; Without metadata, bare type codes keep decoding as text.
+    (should (equal (mysql--parse-value
+                    (encode-coding-string "plain" 'utf-8)
+                    mysql-type-blob)
+                   "plain"))))
+
 ;;;; Extended type system tests
 
 (ert-deftest mysql-test-parse-date ()
@@ -878,6 +914,37 @@
     (should-not (buffer-live-p buffer))
     (should-not (mysql-conn-response-pending conn))))
 
+(ert-deftest mysql-test-mid-response-quit-closes-connection ()
+  "A quit after response parsing has begun must close CONN, not keep it.
+Once packets of the response are consumed the stream sits mid-response,
+and a later drain would parse a row as a response header; a row whose
+first byte is zero reads as OK and leaves the remaining rows for the
+next command's reader."
+  (let* ((buffer (generate-new-buffer " *mysql-test-mid-response-quit*"))
+         (process (make-pipe-process :name "mysql-test-mid-response-quit"
+                                     :buffer buffer :noquery t))
+         (conn (make-mysql-conn :process process :buf buffer)))
+    (unwind-protect
+        (let (caught)
+          ;; `should-error' does not catch quit, so trap it explicitly.
+          (condition-case nil
+              (mysql--run-command-response
+               conn "query"
+               (lambda ()
+                 ;; The first response packet has been consumed, so the
+                 ;; drainable window is over.
+                 (setf (mysql-conn-response-drainable conn) nil)
+                 (signal 'quit nil)))
+            (quit (setq caught t)))
+          (should caught)
+          (should-not (mysql-live-p conn))
+          (should-not (buffer-live-p buffer))
+          (should-not (mysql-conn-response-pending conn)))
+      (when (process-live-p process)
+        (delete-process process))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
 (ert-deftest mysql-test-active-nonlocal-exit-preserves-response-for-drain ()
   "A nonlocal exit during a drainable query should leave CONN drainable."
   (let* ((buffer (generate-new-buffer " *mysql-test-active-quit*"))
@@ -896,8 +963,7 @@
                :quit))
           (should (mysql-live-p conn))
           (should (buffer-live-p buffer))
-          (should (mysql-conn-response-pending conn))
-          (should-not (mysql-conn-response-active conn)))
+          (should (mysql-conn-response-pending conn)))
       (when (process-live-p process)
         (delete-process process))
       (when (buffer-live-p buffer)
@@ -1129,7 +1195,9 @@
     (should (= (nth 1 row) #xffffffff))
     (should (equal (nth 2 row) "中文"))
     (should (= (nth 3 row) 256))
-    (should (= (nth 4 row) 12.5))
+    ;; DECIMAL keeps its exact digit string; a float cannot represent
+    ;; every value the type exists to keep exact.
+    (should (equal (nth 4 row) "12.5"))
     (should (= (gethash "x" (nth 5 row)) 1))))
 
 (ert-deftest mysql-test-binary-blob-type-respects-character-set ()

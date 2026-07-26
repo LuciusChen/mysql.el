@@ -8,9 +8,8 @@ classic MySQL protocol directly and does not shell out to the =mysql= CLI.
 * Features
 
 - TLS connections
-- Authentication with =mysql_native_password=
-- Authentication with =caching_sha2_password=
-- Authentication with =sha256_password=
+- Authentication with =mysql_native_password= and =caching_sha2_password=;
+  other server plugins such as =sha256_password= are reported as unsupported
 - Prepared statements
 - Server-side prepared statement cursors with =mysql-execute-cursor= and =mysql-fetch=
 - Transactions

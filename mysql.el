@@ -190,7 +190,6 @@ also accepted."
   (read-offset 0)
   tls
   (busy nil)
-  (response-active nil)
   (response-pending nil)
   (response-drainable nil))
 
@@ -249,13 +248,16 @@ also accepted."
             (list (format "Connection has a pending response — drain it before sending %s"
                           command-name)))))
 
-(defun mysql--handle-command-interruption (conn &optional preserve-active)
+(defun mysql--handle-command-interruption (conn)
   "Preserve a drainable response on CONN, or close an unsafe connection.
-When PRESERVE-ACTIVE is non-nil, preserve an active response even after its
-first packet has been read.  This supports user interruption followed by an
-out-of-band server-side cancel."
-  (if (or (mysql-conn-response-drainable conn)
-          (and preserve-active (mysql-conn-response-active conn)))
+A response is drainable only while no packet of it has been consumed, so a
+later `mysql-drain-query-response' starts at a response boundary.  Once
+parsing has begun the stream position is inside the response, and a drain
+would read a row as a response header -- a row whose first byte is zero
+parses as OK and leaves the remaining rows for the next command's reader.
+Abandonment mid-response therefore closes the connection, the same
+decision the timeout path already makes."
+  (if (mysql-conn-response-drainable conn)
       (setf (mysql-conn-response-pending conn) t)
     (mysql--cleanup-connection-resources
      (mysql-conn-process conn) (mysql-conn-buf conn)))
@@ -282,14 +284,13 @@ COMMAND-NAME is used in the busy-connection error message."
            (signal (car err) (cdr err)))
           (quit
            (setq handled t)
-           (mysql--handle-command-interruption conn t)
+           (mysql--handle-command-interruption conn)
            (signal (car err) (cdr err))))
       (when (and (not completed)
                  (not handled)
                  (mysql-conn-response-drainable conn))
-        (mysql--handle-command-interruption conn t))
-      (setf (mysql-conn-busy conn) nil
-            (mysql-conn-response-active conn) nil))))
+        (mysql--handle-command-interruption conn))
+      (setf (mysql-conn-busy conn) nil))))
 
 ;;;; Low-level I/O primitives
 
@@ -768,14 +769,12 @@ Returns a plist with column metadata."
         first
       (car (mysql--read-lenenc-int-from-string packet 0)))))
 
-(defun mysql--column-type-vector (columns)
-  "Return a vector of MySQL type codes from COLUMNS."
-  (vconcat (mapcar (lambda (column) (plist-get column :type)) columns)))
-
 (defun mysql--parse-result-row (packet column-count &optional type-vector)
   "Parse a result row from PACKET with COLUMN-COUNT columns.
 Each column value is either NULL (0xFB prefix) or a lenenc-string.
-When TYPE-VECTOR is non-nil, convert values while parsing."
+When TYPE-VECTOR is non-nil, convert values while parsing; its entries
+are MySQL type codes or column metadata plists as accepted by
+`mysql--parse-value'."
   (let ((pos 0)
         (row nil))
     (dotimes (i column-count)
@@ -854,14 +853,30 @@ or nil for zero datetimes."
       (setq result (logior (ash result 8) (aref value i))))
     result))
 
-(defun mysql--parse-typed-value (value type)
-  "Parse non-null string VALUE according to MySQL column TYPE code."
+(defun mysql--binary-string-column-p (column)
+  "Return non-nil when COLUMN stores bytes rather than encoded text.
+Binary-ness comes from the column metadata: the binary character set, the
+BINARY column flag, or the GEOMETRY type.  Without metadata the column is
+treated as text."
+  (let ((type (plist-get column :type))
+        (flags (or (plist-get column :flags) 0))
+        (character-set (plist-get column :character-set)))
+    (or (and character-set (= character-set mysql--binary-character-set))
+        (not (zerop (logand flags mysql--column-flag-binary)))
+        (and type (= type mysql-type-geometry)))))
+
+(defun mysql--parse-typed-value (value type &optional column)
+  "Parse non-null string VALUE according to MySQL column TYPE code.
+COLUMN, when non-nil, is the column metadata plist; it decides whether a
+string-typed VALUE is text to decode or bytes to return unchanged.
+DECIMAL values return their exact digit string, since a float cannot
+represent every value the type exists to keep exact."
   (if-let* ((custom (alist-get type mysql-type-parsers)))
       (funcall custom value)
     (pcase type
       ((or 1 2 3 8 9)   (string-to-number value))  ;; integers
       ((or 4 5)         (string-to-number value))  ;; float/double
-      ((or 0 246)       (string-to-number value))  ;; decimal/newdecimal
+      ((or 0 246)       (decode-coding-string value 'utf-8))  ;; decimal/newdecimal
       (13               (string-to-number value))  ;; year
       ((or 7 12)        (mysql--parse-datetime value))
       (10               (mysql--parse-date value))
@@ -870,12 +885,20 @@ or nil for zero datetimes."
       (245
        (let ((s (decode-coding-string value 'utf-8)))
          (json-parse-string s)))
-      (_                (decode-coding-string value 'utf-8)))))
+      (_ (if (mysql--binary-string-column-p column)
+             value
+           (decode-coding-string value 'utf-8))))))
 
-(defun mysql--parse-value (value type)
-  "Parse string VALUE according to MySQL column TYPE code.
-Returns the converted Elisp value, or nil for SQL NULL."
-  (when value (mysql--parse-typed-value value type)))
+(defun mysql--parse-value (value type-or-column)
+  "Parse string VALUE according to TYPE-OR-COLUMN.
+TYPE-OR-COLUMN is a MySQL column TYPE code, or a column metadata plist
+whose `:type' names it and whose character set and flags decide binary
+string handling.  Returns the converted Elisp value, or nil for SQL NULL."
+  (when value
+    (let ((column (if (integerp type-or-column)
+                      (list :type type-or-column)
+                    type-or-column)))
+      (mysql--parse-typed-value value (plist-get column :type) column))))
 
 ;;;; TLS support
 
@@ -1192,8 +1215,7 @@ Signals `mysql-error' if CONN is busy with another command."
      (setf (mysql-conn-sequence-id conn) 0)
      (mysql--send-packet conn (concat (unibyte-string #x03)
                                       (encode-coding-string sql 'utf-8)))
-     (setf (mysql-conn-response-active conn) t
-           (mysql-conn-response-drainable conn) t)
+     (setf (mysql-conn-response-drainable conn) t)
      (let ((packet (mysql--read-packet conn)))
        (setf (mysql-conn-response-drainable conn) nil)
        (mysql--handle-query-response conn packet)))))
@@ -1258,7 +1280,7 @@ Returns a list of column plists.  Also consumes the EOF packet."
   "Read text protocol rows from CONN until EOF.
 COL-COUNT and COLUMNS guide parsing.  Returns rows in order."
   (let ((rows nil)
-        (type-vector (mysql--column-type-vector columns)))
+        (type-vector (vconcat columns)))
     (cl-loop
      (let ((row-packet (mysql--read-packet conn)))
        (pcase (mysql--packet-type row-packet)
@@ -1712,21 +1734,18 @@ Returns (string . new-pos)."
     (- value (ash 1 (* bytes 8)))))
 
 (defun mysql--binary-text-value (value column)
-  "Decode binary protocol string VALUE using COLUMN metadata."
-  (let ((type (plist-get column :type))
-        (flags (or (plist-get column :flags) 0))
-        (character-set (plist-get column :character-set)))
+  "Decode binary protocol string VALUE using COLUMN metadata.
+DECIMAL values return their exact digit string, matching the text
+protocol."
+  (let ((type (plist-get column :type)))
     (cond
      ((= type mysql-type-bit) (mysql--parse-bit value))
      ((memq type (list mysql-type-decimal mysql-type-newdecimal))
-      (string-to-number (decode-coding-string value 'utf-8)))
+      (decode-coding-string value 'utf-8))
      ((= type mysql-type-json)
       (let ((text (decode-coding-string value 'utf-8)))
         (json-parse-string text)))
-     ((or (and character-set (= character-set mysql--binary-character-set))
-          (not (zerop (logand flags mysql--column-flag-binary)))
-          (= type mysql-type-geometry))
-      value)
+     ((mysql--binary-string-column-p column) value)
      (t (decode-coding-string value 'utf-8)))))
 
 (defun mysql--decode-binary-value (packet pos column)
