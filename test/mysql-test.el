@@ -1627,4 +1627,121 @@ Skips unless both `mysql-test-password' and
               (mysql-query-error nil))
           (mysql-disconnect admin))))))
 
+(ert-deftest mysql-test-live-default-connect-auto-tls-retry ()
+  :tags '(:mysql-live :mysql-tls)
+  "A default connect should retry caching_sha2 full auth over TLS."
+  (if (or (null mysql-test-password) (null mysql-test-tls-enabled))
+      (ert-skip "Set mysql-test-password and mysql-test-tls-enabled for TLS tests")
+    (let ((mysql-tls-verify-server nil)
+          (user "_mysql_el_autoretry")
+          (created nil))
+      (let ((admin (mysql-connect :host mysql-test-host
+                                  :port mysql-test-port
+                                  :user mysql-test-user
+                                  :password mysql-test-password
+                                  :database mysql-test-database
+                                  :tls t)))
+        (unwind-protect
+            (progn
+              (condition-case nil
+                  (mysql-query admin (format "DROP USER IF EXISTS '%s'@'%%'" user))
+                (mysql-query-error nil))
+              (condition-case err
+                  (progn
+                    (mysql-query admin
+                      (format "CREATE USER '%s'@'%%' IDENTIFIED WITH caching_sha2_password BY 'testpw'" user))
+                    (mysql-query admin (format "GRANT ALL ON *.* TO '%s'@'%%'" user))
+                    (mysql-query admin "FLUSH PRIVILEGES")
+                    (setq created t))
+                (mysql-query-error
+                 (ert-skip (format "Server does not support caching_sha2_password: %s"
+                                   (cadr err))))))
+          (mysql-disconnect admin)))
+      (unwind-protect
+          (let ((conn (mysql-connect :host mysql-test-host
+                                     :port mysql-test-port
+                                     :user user
+                                     :password "testpw"
+                                     :database mysql-test-database)))
+            (should (mysql-conn-tls conn))
+            (let ((result (mysql-query conn "SELECT CURRENT_USER()")))
+              (should (string-prefix-p user
+                                       (car (car (mysql-result-rows result)))))))
+        (when created
+          (let ((admin (mysql-connect :host mysql-test-host
+                                      :port mysql-test-port
+                                      :user mysql-test-user
+                                      :password mysql-test-password
+                                      :database mysql-test-database
+                                      :tls t)))
+            (unwind-protect
+                (condition-case nil
+                    (mysql-query admin (format "DROP USER IF EXISTS '%s'@'%%'" user))
+                  (mysql-query-error nil))
+              (mysql-disconnect admin))))))))
+
+(ert-deftest mysql-test-execute-integer-boundaries ()
+  "Prepared parameters preserve signed and unsigned 64-bit integers."
+  (dolist (value (list (- (ash 1 63)) -1 0 (1- (ash 1 63))
+                       (ash 1 63) (1- (ash 1 64))))
+    (let* ((conn (make-mysql-conn))
+           (stmt (make-mysql-stmt :conn conn :id 7 :param-count 1))
+           packet)
+      (cl-letf (((symbol-function 'mysql--send-packet)
+                 (lambda (_conn bytes) (setq packet bytes)))
+                ((symbol-function 'mysql--read-packet)
+                 (lambda (_conn) (unibyte-string 0 0 0 2 0 0 0))))
+        (mysql-execute stmt value))
+      (let ((unsigned (not (zerop (logand (aref packet 13) #x80))))
+            (raw (mysql--read-le-uint packet 14 8)))
+        (should (= (mysql--signed-integer raw 8 unsigned) value))))))
+
+(ert-deftest mysql-test-execute-rejects-out-of-range-integers-before-send ()
+  "Unrepresentable integers never reach the transport."
+  (dolist (value (list (1- (- (ash 1 63))) (ash 1 64)))
+    (let* ((conn (make-mysql-conn))
+           (stmt (make-mysql-stmt :conn conn :id 7 :param-count 1))
+           sent)
+      (cl-letf (((symbol-function 'mysql--send-packet)
+                 (lambda (&rest _) (setq sent t)))
+                ((symbol-function 'mysql--read-packet)
+                 (lambda (_conn) (unibyte-string 0 0 0 2 0 0 0))))
+        (should-error (mysql-execute stmt value) :type 'mysql-stmt-error))
+      (should-not sent))))
+
+(ert-deftest mysql-test-connect-abandonment-cleans-auth-transport ()
+  "Quit and throw during authentication release the opened transport."
+  (dolist (exit '(quit throw))
+    (mysql-test--with-pipe-conn conn
+      (let ((proc (mysql-conn-process conn))
+            (buf (mysql-conn-buf conn))
+            caught)
+        (cl-letf (((symbol-function 'mysql--open-connection)
+                   (lambda (&rest _) (cons proc buf)))
+                  ((symbol-function 'mysql--authenticate)
+                   (lambda (&rest _)
+                     (pcase exit
+                       ('quit (signal 'quit nil))
+                       ('throw (throw 'mysql-test-exit :aborted))))))
+          (setq caught
+                (catch 'mysql-test-exit
+                  (condition-case nil
+                      (mysql-connect :user "audit")
+                    (quit :aborted)))))
+        (should (eq caught :aborted))
+        (should-not (process-live-p proc))
+        (should-not (buffer-live-p buf))))))
+
+(ert-deftest mysql-test-live-prepared-integer-boundaries ()
+  :tags '(:mysql-live)
+  "A real prepared statement round-trips signed and unsigned boundaries."
+  (mysql-test--with-conn conn
+    (let ((stmt (mysql-prepare conn "SELECT ? AS boundary")))
+      (unwind-protect
+          (dolist (value (list (- (ash 1 63)) -1 0 (1- (ash 1 63))
+                               (ash 1 63) (1- (ash 1 64)) -1))
+            (should (equal (mysql-result-rows (mysql-execute stmt value))
+                           (list (list value)))))
+        (mysql-stmt-close stmt)))))
+
 ;;; mysql-test.el ends here

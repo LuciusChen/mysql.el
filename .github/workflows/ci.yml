@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  elisp:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        emacs-version: ["28.1", "30.2"]
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: test
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd="mysqladmin ping -h127.0.0.1 -uroot -ptest"
+          --health-interval=5s --health-timeout=5s --health-retries=30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: purcell/setup-emacs@master
+        with:
+          version: ${{ matrix.emacs-version }}
+      - name: Run unit, protocol, and TLS tests
+        run: |
+          emacs -Q --batch -L . -l test/mysql-test.el \
+            --eval '(setq mysql-test-password "test" mysql-test-tls-enabled t mysql-tls-verify-server nil)' \
+            --eval '(ert-run-tests-batch-and-exit)'
+      - name: Compile without warnings
+        run: |
+          emacs -Q --batch -L . --eval '(setq byte-compile-error-on-warn t)' \
+            -f batch-byte-compile mysql.el test/mysql-test.el

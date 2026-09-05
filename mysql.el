@@ -1065,8 +1065,8 @@ Returns (PROCESS . BUFFER)."
         (mysql--cleanup-connection-resources proc buf)))))
 
 (cl-defun mysql-connect (&key (host "127.0.0.1") (port 3306) user password
-                                database (tls nil tls-specified-p) ssl-mode
-                                (read-idle-timeout 30) (connect-timeout 10))
+                              database (tls nil tls-specified-p) ssl-mode
+                              (read-idle-timeout 30) (connect-timeout 10))
   "Connect to a MySQL server and authenticate.
 Returns a `mysql-conn' struct on success.
 
@@ -1085,28 +1085,29 @@ TCP connection wait."
          (tls (eq tls-mode 'required))
          (ssl-mode (mysql--normalize-ssl-mode ssl-mode)))
     (when (and tls (not (mysql--tls-available-p)))
-    (signal 'mysql-connection-error (list "TLS requested but GnuTLS is not available")))
+      (signal 'mysql-connection-error (list "TLS requested but GnuTLS is not available")))
     (pcase-let ((`(,proc . ,buf) (mysql--open-connection host port connect-timeout)))
       (let ((conn (make-mysql-conn :process proc :buf buf
                                    :host host :port port
                                    :user user :database database
                                    :read-idle-timeout read-idle-timeout)))
         (condition-case err
-            (progn
-              (mysql--authenticate conn password tls)
-              conn)
+            (let (authenticated)
+              (unwind-protect
+                  (progn
+                    (mysql--authenticate conn password tls)
+                    (setq authenticated t)
+                    conn)
+                (unless authenticated
+                  (mysql--cleanup-connection-resources proc buf))))
           (mysql-auth-error
-           (mysql--cleanup-connection-resources proc buf)
            (if (mysql--retry-auth-with-tls-p err tls-mode)
                (mysql-connect :host host :port port
                               :user user :password password
                               :database database :tls t :ssl-mode ssl-mode
                               :read-idle-timeout read-idle-timeout
                               :connect-timeout connect-timeout)
-             (signal (car err) (cdr err))))
-          (error
-           (mysql--cleanup-connection-resources proc buf)
-           (signal (car err) (cdr err))))))))
+             (signal (car err) (cdr err)))))))))
 
 (defun mysql--handle-auth-switch (conn password packet)
   "Handle an AUTH_SWITCH_REQUEST in PACKET for CONN.
@@ -1422,7 +1423,11 @@ Returns a `mysql-stmt'."
 Returns a cons (TYPE-CODE . UNSIGNED-FLAG)."
   (cond
    ((null value) (cons mysql-type-null 0))
-   ((integerp value) (cons mysql-type-longlong 0))
+   ((integerp value)
+    (unless (<= (- (ash 1 63)) value (1- (ash 1 64)))
+      (signal 'mysql-stmt-error
+              (list "Integer parameter is outside the 64-bit MySQL range")))
+    (cons mysql-type-longlong (if (>= value (ash 1 63)) #x80 0)))
    ((floatp value) (cons mysql-type-var-string 0))
    ((stringp value) (cons mysql-type-var-string 0))
    (t (cons mysql-type-var-string 0))))

@@ -64,6 +64,8 @@ command responses with =mysql-max-message-bytes= and
 prepared binary rows honor column signedness and decode text, JSON, DECIMAL,
 BIT, and binary values from full column metadata.
 
+Prepared integer parameters preserve the full signed and unsigned 64-bit range. Values outside that combined range raise =mysql-stmt-error= before transmission. Quitting or otherwise abandoning authentication releases the partially established connection and its process buffer.
+
 * Installation
 
 Install =mysql= from MELPA:
