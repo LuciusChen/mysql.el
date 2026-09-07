@@ -1314,7 +1314,11 @@ COL-COUNT and COLUMNS guide parsing.  Returns rows in order."
     (cl-loop
      (let ((row-packet (mysql--read-packet conn)))
        (pcase (mysql--packet-type row-packet)
-         ('eof (cl-return nil))
+         ('eof
+          (when-let* ((status (plist-get (mysql--parse-eof-packet row-packet)
+                                         :status-flags)))
+            (setf (mysql-conn-status-flags conn) status))
+          (cl-return nil))
          ('err
           (let ((err-info (mysql--parse-err-packet row-packet)))
             (signal 'mysql-query-error
@@ -1612,11 +1616,10 @@ closed early with `mysql-cursor-close'."
          (mysql--send-packet conn (mysql--build-fetch-packet stmt row-count))
          (let* ((read (mysql--read-binary-rows-with-status conn columns))
                 (status-flags (plist-get read :status-flags)))
-           (when status-flags
-             (setf (mysql-conn-status-flags conn) status-flags)
-             (when (not (zerop (logand status-flags
-                                        mysql--server-status-last-row-sent)))
-               (setf (mysql-cursor-exhausted-p cursor) t)))
+           (when (and status-flags
+                      (not (zerop (logand status-flags
+                                          mysql--server-status-last-row-sent))))
+             (setf (mysql-cursor-exhausted-p cursor) t))
            (make-mysql-result
             :connection conn
             :status "OK"
@@ -1682,6 +1685,8 @@ COLUMNS is the column-definition list.  Return a plist with :rows,
            (cond
             ((and (= (aref row-packet 0) #xfe) (<= (length row-packet) 9))
              (let ((eof-info (mysql--parse-eof-packet row-packet)))
+               (when-let* ((status (plist-get eof-info :status-flags)))
+                 (setf (mysql-conn-status-flags conn) status))
                (cl-return (list :rows (nreverse rows)
                                 :warnings (plist-get eof-info :warnings)
                                 :status-flags (plist-get eof-info :status-flags)))))

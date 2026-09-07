@@ -700,6 +700,51 @@ rejects overlapping commands."
                  (unibyte-string #xfe #x00 #x00 #x02 #x00))
                 :type 'mysql-protocol-error))
 
+(ert-deftest mysql-test-result-eof-updates-transaction-state ()
+  "Text and prepared results publish the final server transaction state."
+  (dolist (binary '(nil t))
+    (dolist (with-row '(nil t))
+      (let* ((conn (make-mysql-conn :status-flags 2 :capability-flags 0))
+             (stmt (make-mysql-stmt :conn conn :id 1 :param-count 0))
+             (columns (list (list :name "id" :type mysql-type-long))))
+        (dolist (status '(1 0 2 3 2))
+          (let ((packets
+                 (append (list (unibyte-string 1))
+                         (when with-row
+                           (list (if binary (unibyte-string 0 0 42 0 0 0)
+                                   (unibyte-string 2 ?4 ?2))))
+                         (list (unibyte-string #xfe 0 0 status 0)))))
+            (cl-letf (((symbol-function 'mysql--send-packet) #'ignore)
+                      ((symbol-function 'mysql--read-packet)
+                       (lambda (_conn) (pop packets)))
+                      ((symbol-function 'mysql--read-column-definitions)
+                       (lambda (_conn _count) columns)))
+              (let ((result (if binary (mysql-execute stmt)
+                              (mysql-query conn "SELECT id FROM items"))))
+                (should (equal (mysql-result-rows result)
+                               (when with-row '((42)))))
+                (should (= (mysql-conn-status-flags conn) status))
+                (should (eq (mysql-in-transaction-p conn)
+                            (not (zerop (logand status 1)))))
+                (should (eq (mysql-autocommit-p conn)
+                            (not (zerop (logand status 2)))))
+                (should-not packets)))))))))
+
+(ert-deftest mysql-test-fetch-eof-publishes-status ()
+  "Cursor fetch retains status and warnings from its real EOF decoder."
+  (let* ((conn (make-mysql-conn :status-flags 2))
+         (stmt (make-mysql-stmt :conn conn :id 1 :param-count 0))
+         (cursor (make-mysql-cursor :stmt stmt :columns nil)))
+    (dolist (status '(65 129))
+      (cl-letf (((symbol-function 'mysql--send-packet) #'ignore)
+                ((symbol-function 'mysql--read-packet)
+                 (lambda (_conn) (unibyte-string #xfe 7 0 status 0))))
+        (should (= (mysql-result-warnings (mysql-fetch cursor 10)) 7))
+        (should (= (mysql-conn-status-flags conn) status))
+        (should (mysql-in-transaction-p conn))
+        (should-not (mysql-autocommit-p conn))
+        (should (eq (mysql-cursor-exhausted-p cursor) (= status 129)))))))
+
 (ert-deftest mysql-test-parse-eof-packet ()
   "Test EOF packet status parsing."
   (let ((info (mysql--parse-eof-packet

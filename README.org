@@ -41,6 +41,8 @@ classic MySQL protocol directly and does not shell out to the =mysql= CLI.
 Transaction helpers are available when you want explicit control over the
 session state:
 
+=mysql-in-transaction-p= and =mysql-autocommit-p= track server status from completed text and prepared query results as well as OK responses. In particular, a result-set query that opens a transaction in manual mode is visible to callers without issuing another query.
+
 #+begin_src emacs-lisp
 (mysql-set-autocommit conn nil)
 (unwind-protect
