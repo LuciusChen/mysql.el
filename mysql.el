@@ -196,7 +196,7 @@ also accepted."
 (cl-defstruct mysql-result
   "A MySQL query result."
   connection
-  status
+  (status "OK")
   columns
   rows
   affected-rows
@@ -478,8 +478,7 @@ Handles splitting payloads larger than 0xFFFFFF."
 
 (defun mysql--sha1 (data)
   "Return the SHA-1 hash of DATA (a unibyte string) as a unibyte string."
-  (let ((hex (secure-hash 'sha1 data nil nil t)))
-    hex))
+  (secure-hash 'sha1 data nil nil t))
 
 (defun mysql--xor-strings (a b)
   "XOR two equal-length unibyte strings A and B."
@@ -604,19 +603,24 @@ Returns a plist with :salt and :auth-plugin."
           (if (mysql-conn-tls conn) mysql--cap-ssl 0)
           (if (mysql-conn-database conn) mysql--cap-connect-with-db 0)))
 
+(defun mysql--client-flags-prefix (client-flags)
+  "Return the 32-byte CLIENT-FLAGS/max-packet-size/charset/filler prefix.
+This prefix opens both a HandshakeResponse41 packet and an SSL_REQUEST
+packet; see `mysql--build-handshake-response' and `mysql--build-ssl-request'."
+  (concat (mysql--int-le-bytes client-flags 4)
+          (mysql--int-le-bytes #x00ffffff 4)  ;; max_packet_size
+          (unibyte-string 45)                  ;; charset: utf8mb4
+          (make-string 23 0)))                 ;; filler
+
 (defun mysql--build-handshake-response (conn password salt auth-plugin)
   "Build a HandshakeResponse41 packet for CONN.
 PASSWORD is the user password, SALT is the server nonce, AUTH-PLUGIN
 is the authentication plugin name."
   (let* ((client-flags (mysql--client-capabilities conn))
          (auth-response (mysql--compute-auth-response password salt auth-plugin))
-         (parts nil))
+         (parts (list (mysql--client-flags-prefix client-flags))))
     (setf (mysql-conn-capability-flags conn)
           (logand client-flags (mysql-conn-capability-flags conn)))
-    (push (mysql--int-le-bytes client-flags 4) parts)
-    (push (mysql--int-le-bytes #x00ffffff 4) parts)  ;; max_packet_size
-    (push (unibyte-string 45) parts)                  ;; charset: utf8mb4
-    (push (make-string 23 0) parts)                   ;; filler
     (push (concat (encode-coding-string (mysql-conn-user conn) 'utf-8)
                   (unibyte-string 0))
           parts)
@@ -686,6 +690,16 @@ Returns a plist with :code, :state, :message."
       (cl-incf pos 5))
     (setq message (decode-coding-string (substring packet pos) 'utf-8))
     (list :code code :state state :message message)))
+
+(defun mysql--err-packet-message (packet)
+  "Return a \"[code] (state) message\" string describing ERR_Packet PACKET.
+The \"(state)\" segment is included only when PACKET carries a SQL state."
+  (let* ((err-info (mysql--parse-err-packet packet))
+         (state (plist-get err-info :state)))
+    (format "[%d] %s%s"
+            (plist-get err-info :code)
+            (if state (format "(%s) " state) "")
+            (plist-get err-info :message))))
 
 (defun mysql--packet-type (packet)
   "Determine the type of PACKET from its first byte.
@@ -772,10 +786,7 @@ Returns a plist with column metadata."
 
 (defun mysql--result-column-count (packet)
   "Return the column count encoded in result-set header PACKET."
-  (let ((first (aref packet 0)))
-    (if (< first #xfb)
-        first
-      (car (mysql--read-lenenc-int-from-string packet 0)))))
+  (car (mysql--read-lenenc-int-from-string packet 0)))
 
 (defun mysql--parse-result-row (packet column-count &optional type-vector)
   "Parse a result row from PACKET with COLUMN-COUNT columns.
@@ -879,58 +890,45 @@ COLUMN, when non-nil, is the column metadata plist; it decides whether a
 string-typed VALUE is text to decode or bytes to return unchanged.
 DECIMAL values return their exact digit string, since a float cannot
 represent every value the type exists to keep exact."
-  (if-let* ((custom (alist-get type mysql-type-parsers)))
-      (funcall custom value)
-    (pcase type
-      ((or 1 2 3 8 9)   (string-to-number value))  ;; integers
-      ((or 4 5)         (string-to-number value))  ;; float/double
-      ((or 0 246)       (decode-coding-string value 'utf-8))  ;; decimal/newdecimal
-      (13               (string-to-number value))  ;; year
-      ((or 7 12)        (mysql--parse-datetime value))
-      (10               (mysql--parse-date value))
-      (11               (mysql--parse-time value))
-      (16               (mysql--parse-bit value))
-      (245
-       (let ((s (decode-coding-string value 'utf-8)))
-         (json-parse-string s)))
-      (_ (if (mysql--binary-string-column-p column)
-             value
-           (decode-coding-string value 'utf-8))))))
+  (pcase type
+    ((or 1 2 3 8 9)   (string-to-number value))  ;; integers
+    ((or 4 5)         (string-to-number value))  ;; float/double
+    ((or 0 246)       (decode-coding-string value 'utf-8))  ;; decimal/newdecimal
+    (13               (string-to-number value))  ;; year
+    ((or 7 12)        (mysql--parse-datetime value))
+    (10               (mysql--parse-date value))
+    (11               (mysql--parse-time value))
+    (16               (mysql--parse-bit value))
+    (245
+     (let ((s (decode-coding-string value 'utf-8)))
+       (json-parse-string s)))
+    (_ (if (mysql--binary-string-column-p column)
+           value
+         (decode-coding-string value 'utf-8)))))
 
 (defun mysql--parse-value (value type-or-column)
   "Parse string VALUE according to TYPE-OR-COLUMN.
 TYPE-OR-COLUMN is a MySQL column TYPE code, or a column metadata plist
 whose `:type' names it and whose character set and flags decide binary
-string handling.  Returns the converted Elisp value, or nil for SQL NULL."
+string handling.  Returns the converted Elisp value, or nil for SQL NULL.
+`mysql-type-parsers' overrides are consulted here only: the binary
+protocol's `mysql--decode-binary-value' calls `mysql--parse-typed-value'
+directly, so prepared-statement results are unaffected by overrides."
   (when value
-    (let ((column (if (integerp type-or-column)
-                      (list :type type-or-column)
-                    type-or-column)))
-      (mysql--parse-typed-value value (plist-get column :type) column))))
+    (let* ((column (if (integerp type-or-column)
+                       (list :type type-or-column)
+                     type-or-column))
+           (custom (alist-get (plist-get column :type) mysql-type-parsers)))
+      (if custom
+          (funcall custom value)
+        (mysql--parse-typed-value value (plist-get column :type) column)))))
 
 ;;;; TLS support
 
-(defun mysql--tls-available-p ()
-  "Return non-nil if GnuTLS support is available in this Emacs."
-  (gnutls-available-p))
-
 (defun mysql--build-ssl-request (conn)
   "Build a 32-byte SSL_REQUEST packet for CONN."
-  (let* ((client-flags (logior mysql--cap-long-password
-                               mysql--cap-found-rows
-                               mysql--cap-long-flag
-                               mysql--cap-protocol-41
-                               mysql--cap-ssl
-                               mysql--cap-transactions
-                               mysql--cap-secure-connection
-                               mysql--cap-plugin-auth
-                               (if (mysql-conn-database conn)
-                                   mysql--cap-connect-with-db
-                                 0))))
-    (concat (mysql--int-le-bytes client-flags 4)
-            (mysql--int-le-bytes #x00ffffff 4)
-            (unibyte-string 45)
-            (make-string 23 0))))
+  (mysql--client-flags-prefix
+   (logior (mysql--client-capabilities conn) mysql--cap-ssl)))
 
 (defun mysql--upgrade-to-tls (conn)
   "Upgrade CONN's network connection to TLS using GnuTLS."
@@ -950,13 +948,6 @@ string handling.  Returns the converted Elisp value, or nil for SQL NULL."
   (when (process-live-p proc) (delete-process proc))
   (when (buffer-live-p buf) (kill-buffer buf)))
 
-(defun mysql--caching-sha2-full-auth-requires-tls-p (err)
-  "Return non-nil when ERR is the caching_sha2 full-auth TLS requirement."
-  (pcase err
-    (`(mysql-auth-error ,message)
-     (equal message "caching_sha2_password full authentication requires TLS"))
-    (_ nil)))
-
 (defun mysql--requested-tls-mode (tls tls-specified-p ssl-mode)
   "Return the requested TLS mode for TLS, TLS-SPECIFIED-P, and SSL-MODE.
 The return value is one of the symbols `default', `required', or `disabled'."
@@ -975,8 +966,11 @@ The return value is one of the symbols `default', `required', or `disabled'."
 ERR is the condition data raised during authentication and TLS-MODE is the
 original connection mode."
   (and (eq tls-mode 'default)
-       (mysql--tls-available-p)
-       (mysql--caching-sha2-full-auth-requires-tls-p err)))
+       (gnutls-available-p)
+       (pcase err
+         (`(mysql-auth-error ,message)
+          (equal message "caching_sha2_password full authentication requires TLS"))
+         (_ nil))))
 
 ;;;; Connection
 
@@ -1082,9 +1076,8 @@ TCP connection wait."
   (unless user
     (signal 'mysql-connection-error (list "No user specified")))
   (let* ((tls-mode (mysql--requested-tls-mode tls tls-specified-p ssl-mode))
-         (tls (eq tls-mode 'required))
-         (ssl-mode (mysql--normalize-ssl-mode ssl-mode)))
-    (when (and tls (not (mysql--tls-available-p)))
+         (tls (eq tls-mode 'required)))
+    (when (and tls (not (gnutls-available-p)))
       (signal 'mysql-connection-error (list "TLS requested but GnuTLS is not available")))
     (pcase-let ((`(,proc . ,buf) (mysql--open-connection host port connect-timeout)))
       (let ((conn (make-mysql-conn :process proc :buf buf
@@ -1102,9 +1095,10 @@ TCP connection wait."
                   (mysql--cleanup-connection-resources proc buf))))
           (mysql-auth-error
            (if (mysql--retry-auth-with-tls-p err tls-mode)
+               ;; Only the default TLS mode retries, and it implies no SSL-MODE.
                (mysql-connect :host host :port port
                               :user user :password password
-                              :database database :tls t :ssl-mode ssl-mode
+                              :database database :tls t
                               :read-idle-timeout read-idle-timeout
                               :connect-timeout connect-timeout)
              (signal (car err) (cdr err)))))))))
@@ -1140,11 +1134,9 @@ using SALT and AUTH-PLUGIN."
           (let ((ok-info (mysql--parse-ok-packet ok-packet)))
             (setf (mysql-conn-status-flags conn) (plist-get ok-info :status-flags))))
          ('err
-          (let ((err-info (mysql--parse-err-packet ok-packet)))
-            (signal 'mysql-auth-error
-                    (list (format "Auth failed after fast-auth: [%d] %s"
-                                  (plist-get err-info :code)
-                                  (plist-get err-info :message)))))))))
+          (signal 'mysql-auth-error
+                  (list (concat "Auth failed after fast-auth: "
+                                (mysql--err-packet-message ok-packet))))))))
     (#x04
      ;; Full authentication required
      (if (mysql-conn-tls conn)
@@ -1177,11 +1169,9 @@ SALT is the nonce, AUTH-PLUGIN is the current auth plugin name."
        (let ((ok-info (mysql--parse-ok-packet packet)))
          (setf (mysql-conn-status-flags conn) (plist-get ok-info :status-flags))))
       (#xff
-       (let ((err-info (mysql--parse-err-packet packet)))
-         (signal 'mysql-auth-error
-                 (list (format "Authentication failed: [%d] %s"
-                               (plist-get err-info :code)
-                               (plist-get err-info :message))))))
+       (signal 'mysql-auth-error
+               (list (concat "Authentication failed: "
+                             (mysql--err-packet-message packet)))))
       (#xfe
        (mysql--handle-auth-switch conn password packet))
       (#x01
@@ -1193,29 +1183,23 @@ SALT is the nonce, AUTH-PLUGIN is the current auth plugin name."
 
 ;;;; Query execution
 
+(defun mysql--ok-packet-result (conn packet)
+  "Build a `mysql-result' from OK_Packet PACKET, updating CONN's status flags."
+  (let ((ok-info (mysql--parse-ok-packet packet)))
+    (setf (mysql-conn-status-flags conn) (plist-get ok-info :status-flags))
+    (make-mysql-result
+     :connection conn
+     :affected-rows (plist-get ok-info :affected-rows)
+     :last-insert-id (plist-get ok-info :last-insert-id)
+     :warnings (plist-get ok-info :warnings))))
+
 (defun mysql--handle-query-response (conn packet)
   "Dispatch on PACKET type and return a `mysql-result' for CONN."
   (condition-case err
       (pcase (mysql--packet-type packet)
-        ('ok
-         (let ((ok-info (mysql--parse-ok-packet packet)))
-           (setf (mysql-conn-status-flags conn)
-                 (plist-get ok-info :status-flags))
-           (make-mysql-result
-            :connection conn
-            :status "OK"
-            :affected-rows (plist-get ok-info :affected-rows)
-            :last-insert-id (plist-get ok-info :last-insert-id)
-            :warnings (plist-get ok-info :warnings))))
+        ('ok (mysql--ok-packet-result conn packet))
         ('err
-         (let ((err-info (mysql--parse-err-packet packet)))
-           (signal 'mysql-query-error
-                   (list (format "[%d] %s%s"
-                                 (plist-get err-info :code)
-                                 (if (plist-get err-info :state)
-                                     (format "(%s) " (plist-get err-info :state))
-                                   "")
-                                 (plist-get err-info :message))))))
+         (signal 'mysql-query-error (list (mysql--err-packet-message packet))))
         (_
          ;; Result set: first byte is column_count (lenenc int)
          (mysql--read-result-set conn packet)))
@@ -1320,11 +1304,7 @@ COL-COUNT and COLUMNS guide parsing.  Returns rows in order."
             (setf (mysql-conn-status-flags conn) status))
           (cl-return nil))
          ('err
-          (let ((err-info (mysql--parse-err-packet row-packet)))
-            (signal 'mysql-query-error
-                    (list (format "[%d] %s"
-                                  (plist-get err-info :code)
-                                  (plist-get err-info :message))))))
+          (signal 'mysql-query-error (list (mysql--err-packet-message row-packet))))
          (_ (push (mysql--parse-result-row row-packet col-count type-vector)
                   rows)))))
     (nreverse rows)))
@@ -1338,7 +1318,6 @@ FIRST-PACKET contains the column-count.  Returns a `mysql-result'."
              (rows (mysql--read-text-rows conn col-count columns)))
         (make-mysql-result
          :connection conn
-         :status "OK"
          :columns columns
          :rows rows))
     (mysql-query-error
@@ -1355,17 +1334,14 @@ FIRST-PACKET contains the column-count.  Returns a `mysql-result'."
   "Disconnect from MySQL server, sending COM_QUIT.
 CONN is a `mysql-conn' returned by `mysql-connect'."
   (when conn
-    (condition-case err
+    (condition-case nil
         (when (process-live-p (mysql-conn-process conn))
           ;; Send COM_QUIT
           (setf (mysql-conn-sequence-id conn) 0)
           (mysql--send-packet conn (unibyte-string #x01)))
-      (mysql-connection-error nil)
-      (error (signal (car err) (cdr err))))
-    (when (process-live-p (mysql-conn-process conn))
-      (delete-process (mysql-conn-process conn)))
-    (when (buffer-live-p (mysql-conn-buf conn))
-      (kill-buffer (mysql-conn-buf conn)))))
+      (mysql-connection-error nil))
+    (mysql--cleanup-connection-resources
+     (mysql-conn-process conn) (mysql-conn-buf conn))))
 
 ;;;; Prepared statements
 
@@ -1514,11 +1490,7 @@ Signals `mysql-error' if CONN is busy with another command."
      (let ((packet (mysql--read-packet conn)))
        (pcase (mysql--packet-type packet)
          ('err
-          (let ((err-info (mysql--parse-err-packet packet)))
-            (signal 'mysql-stmt-error
-                    (list (format "[%d] %s"
-                                  (plist-get err-info :code)
-                                  (plist-get err-info :message))))))
+          (signal 'mysql-stmt-error (list (mysql--err-packet-message packet))))
          (_ (mysql--parse-prepare-ok conn packet)))))))
 
 (defun mysql-execute (stmt &rest params)
@@ -1539,21 +1511,9 @@ Signals `mysql-error' if STMT's connection is busy with another command."
          (setf (mysql-stmt-parameter-types stmt) type-vector))
        (let ((packet (mysql--read-packet conn)))
          (pcase (mysql--packet-type packet)
-           ('ok
-            (let ((ok-info (mysql--parse-ok-packet packet)))
-              (setf (mysql-conn-status-flags conn) (plist-get ok-info :status-flags))
-              (make-mysql-result
-               :connection conn
-               :status "OK"
-               :affected-rows (plist-get ok-info :affected-rows)
-               :last-insert-id (plist-get ok-info :last-insert-id)
-               :warnings (plist-get ok-info :warnings))))
+           ('ok (mysql--ok-packet-result conn packet))
            ('err
-            (let ((err-info (mysql--parse-err-packet packet)))
-              (signal 'mysql-stmt-error
-                      (list (format "[%d] %s"
-                                    (plist-get err-info :code)
-                                    (plist-get err-info :message))))))
+            (signal 'mysql-stmt-error (list (mysql--err-packet-message packet))))
            (_
             ;; Binary result set
             (mysql--read-binary-result-set conn packet))))))))
@@ -1579,11 +1539,7 @@ closed early with `mysql-cursor-close'."
        (let ((packet (mysql--read-packet conn)))
          (pcase (mysql--packet-type packet)
            ('err
-            (let ((err-info (mysql--parse-err-packet packet)))
-              (signal 'mysql-stmt-error
-                      (list (format "[%d] %s"
-                                    (plist-get err-info :code)
-                                    (plist-get err-info :message))))))
+            (signal 'mysql-stmt-error (list (mysql--err-packet-message packet))))
            ('ok
             (signal 'mysql-stmt-error
                     (list "Prepared statement did not return a cursor result set")))
@@ -1608,7 +1564,7 @@ closed early with `mysql-cursor-close'."
          (conn (mysql-stmt-conn stmt))
          (columns (mysql-cursor-columns cursor)))
     (if (mysql-cursor-exhausted-p cursor)
-        (make-mysql-result :connection conn :status "OK" :columns columns :rows nil)
+        (make-mysql-result :connection conn :columns columns :rows nil)
       (mysql--run-command-response
        conn "prepared statement cursor fetch"
        (lambda ()
@@ -1622,7 +1578,6 @@ closed early with `mysql-cursor-close'."
              (setf (mysql-cursor-exhausted-p cursor) t))
            (make-mysql-result
             :connection conn
-            :status "OK"
             :columns columns
             :rows (plist-get read :rows)
             :warnings (plist-get read :warnings))))))))
@@ -1642,11 +1597,7 @@ closed early with `mysql-cursor-close'."
             (setf (mysql-stmt-parameter-types stmt) nil)
             t)
            ('err
-            (let ((err-info (mysql--parse-err-packet packet)))
-              (signal 'mysql-stmt-error
-                      (list (format "[%d] %s"
-                                    (plist-get err-info :code)
-                                    (plist-get err-info :message))))))
+            (signal 'mysql-stmt-error (list (mysql--err-packet-message packet))))
            (_
             (signal 'mysql-protocol-error
                     (list "Unexpected response to COM_STMT_RESET")))))))))
@@ -1691,11 +1642,8 @@ COLUMNS is the column-definition list.  Return a plist with :rows,
                                 :warnings (plist-get eof-info :warnings)
                                 :status-flags (plist-get eof-info :status-flags)))))
             ((= (aref row-packet 0) #xff)
-             (let ((err-info (mysql--parse-err-packet row-packet)))
-               (signal 'mysql-stmt-error
-                       (list (format "[%d] %s"
-                                     (plist-get err-info :code)
-                                     (plist-get err-info :message))))))
+             (signal 'mysql-stmt-error
+                     (list (mysql--err-packet-message row-packet))))
             (t
              (push (mysql--parse-binary-row row-packet columns)
                    rows))))))
@@ -1707,11 +1655,6 @@ COLUMNS is the column-definition list.  Return a plist with :rows,
       (mysql-conn-process conn) (mysql-conn-buf conn))
      (signal (car err) (cdr err)))))
 
-(defun mysql--read-binary-rows (conn columns)
-  "Read binary row packets from CONN until EOF, returning rows in order.
-COLUMNS is the column-definition list."
-  (plist-get (mysql--read-binary-rows-with-status conn columns) :rows))
-
 (defun mysql--read-binary-result-set (conn first-packet)
   "Read a binary protocol result set from CONN.
 FIRST-PACKET contains the column count.  Returns a `mysql-result'."
@@ -1720,9 +1663,8 @@ FIRST-PACKET contains the column count.  Returns a `mysql-result'."
              (columns (mysql--read-column-definitions conn col-count)))
         (make-mysql-result
          :connection conn
-         :status "OK"
          :columns columns
-         :rows (mysql--read-binary-rows conn columns)))
+         :rows (plist-get (mysql--read-binary-rows-with-status conn columns) :rows)))
     (mysql-stmt-error
      ;; A server ERR packet terminates the response safely.
      (signal (car err) (cdr err)))
@@ -1739,7 +1681,7 @@ Binary row NULL bitmap has a 2-bit offset."
          (bit-idx (% offset 8)))
     (not (zerop (logand (aref null-bitmap byte-idx) (ash 1 bit-idx))))))
 
-(defun mysql--parse-binary-row (packet columns &optional _type-vector)
+(defun mysql--parse-binary-row (packet columns)
   "Parse a binary protocol row from PACKET using COLUMNS metadata.
 The complete column metadata controls signedness and string decoding."
   ;; First byte is 0x00 (packet header for binary rows)
@@ -1760,38 +1702,16 @@ The complete column metadata controls signedness and string decoding."
               (list "Binary row has trailing or missing bytes")))
     (nreverse row)))
 
-(defun mysql--decode-binary-lenenc-string (packet pos)
-  "Decode a length-encoded string from PACKET at POS.
-Returns (string . new-pos)."
-  (pcase-let ((`(,len . ,start) (mysql--read-lenenc-int-from-string packet pos)))
-    (cons (substring packet start (+ start len)) (+ start len))))
-
 (defun mysql--signed-integer (value bytes unsigned-p)
   "Return VALUE decoded from BYTES, respecting UNSIGNED-P."
   (if (or unsigned-p (zerop (logand value (ash 1 (1- (* bytes 8))))))
       value
     (- value (ash 1 (* bytes 8)))))
 
-(defun mysql--binary-text-value (value column)
-  "Decode binary protocol string VALUE using COLUMN metadata.
-DECIMAL values return their exact digit string, matching the text
-protocol."
-  (let ((type (plist-get column :type)))
-    (cond
-     ((= type mysql-type-bit) (mysql--parse-bit value))
-     ((memq type (list mysql-type-decimal mysql-type-newdecimal))
-      (decode-coding-string value 'utf-8))
-     ((= type mysql-type-json)
-      (let ((text (decode-coding-string value 'utf-8)))
-        (json-parse-string text)))
-     ((mysql--binary-string-column-p column) value)
-     (t (decode-coding-string value 'utf-8)))))
-
 (defun mysql--decode-binary-value (packet pos column)
   "Decode a binary value from PACKET at POS using COLUMN metadata.
 Returns (value . new-pos)."
-  (let* ((column (if (integerp column) (list :type column) column))
-         (type (plist-get column :type))
+  (let* ((type (plist-get column :type))
          (unsigned-p (not (zerop (logand (or (plist-get column :flags) 0)
                                          mysql--column-flag-unsigned)))))
     (pcase type
@@ -1824,8 +1744,10 @@ Returns (value . new-pos)."
      (cons nil pos))
     (_
      (pcase-let ((`(,value . ,new-pos)
-                  (mysql--decode-binary-lenenc-string packet pos)))
-       (cons (mysql--binary-text-value value column) new-pos))))))
+                  (mysql--read-lenenc-string-from-string packet pos)))
+       ;; `mysql-type-parsers' overrides do not apply here; see
+       ;; `mysql--parse-value'.
+       (cons (mysql--parse-typed-value value type column) new-pos))))))
 
 (defun mysql--ieee754-single-to-float (data offset)
   "Decode a 4-byte IEEE 754 single-precision float from DATA at OFFSET."
@@ -2001,11 +1923,8 @@ Signals `mysql-error' if CONN is busy with another command."
        (pcase (mysql--packet-type packet)
          ('ok t)
          ('err
-          (let ((err-info (mysql--parse-err-packet packet)))
-            (signal 'mysql-error
-                    (list (format "Ping failed: [%d] %s"
-                                  (plist-get err-info :code)
-                                  (plist-get err-info :message))))))
+          (signal 'mysql-error
+                  (list (concat "Ping failed: " (mysql--err-packet-message packet)))))
          (_ (signal 'mysql-protocol-error
                     (list "Unexpected response to COM_PING"))))))))
 

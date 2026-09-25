@@ -190,8 +190,7 @@ The type exists to keep values a float cannot represent."
   (let ((digits "1234567890123456789.123456789"))
     (should (equal (mysql--parse-value digits mysql-type-newdecimal) digits))
     (should (equal (mysql--parse-value digits mysql-type-decimal) digits))
-    (should (equal (mysql--binary-text-value
-                    digits (list :type mysql-type-newdecimal))
+    (should (equal (mysql--parse-typed-value digits mysql-type-newdecimal)
                    digits))))
 
 (ert-deftest mysql-test-parse-value-binary-columns-keep-bytes ()
@@ -1069,7 +1068,7 @@ collecting the tls argument of each auth attempt in call order."
   (declare (indent 2) (debug (form symbolp body)))
   `(let ((,tls-flags nil)
          (buffers nil))
-     (cl-letf (((symbol-function 'mysql--tls-available-p) (lambda () t))
+     (cl-letf (((symbol-function 'gnutls-available-p) (lambda () t))
                ((symbol-function 'mysql--open-connection)
                 (lambda (_host _port _timeout)
                   (let ((buf (generate-new-buffer " *mysql-test-auto-tls*")))
@@ -1175,13 +1174,15 @@ collecting the tls argument of each auth attempt in call order."
   "BLOB wire types should still decode textual columns by character set."
   (let ((value (encode-coding-string "中文" 'utf-8)))
     (should
-     (equal (mysql--binary-text-value
-             value (list :type mysql-type-blob :flags 0 :character-set 45))
+     (equal (mysql--parse-typed-value
+             value mysql-type-blob
+             (list :type mysql-type-blob :flags 0 :character-set 45))
             "中文"))
     (should
-     (equal (mysql--binary-text-value
-             value (list :type mysql-type-blob :flags 0
-                         :character-set mysql--binary-character-set))
+     (equal (mysql--parse-typed-value
+             value mysql-type-blob
+             (list :type mysql-type-blob :flags 0
+                   :character-set mysql--binary-character-set))
             value))))
 
 (ert-deftest mysql-test-read-packet-rejects-sequence-mismatch ()
