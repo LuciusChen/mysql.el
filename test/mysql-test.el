@@ -1212,6 +1212,26 @@ of those bytes, and the parser would read prose as a packet header."
                                     "caching_sha2_password")
        :type 'mysql-auth-error))))
 
+(ert-deftest mysql-test-prepare-ok-requires-eof-after-definitions ()
+  "PREPARE_OK definitions must be followed by an EOF packet."
+  (let ((prepare-ok (unibyte-string 0 1 0 0 0 0 0 1 0 0 0 0))) ; 1 param
+    (pcase-dolist (`(,label ,after-definition ,expected)
+                   `(("EOF" ,(unibyte-string #xfe 0 0 2 0) ok)
+                     ("row" ,(unibyte-string 1) mysql-protocol-error)))
+      (ert-info (label)
+        (mysql-test--with-pipe-conn conn
+          (let ((packets (list "definition" after-definition)))
+            (cl-letf (((symbol-function 'mysql--read-packet)
+                       (lambda (_conn) (pop packets)))
+                      ((symbol-function 'mysql--parse-column-definition)
+                       (lambda (_packet) '(:name "p"))))
+              (if (eq expected 'ok)
+                  (should (equal (mysql-stmt-param-definitions
+                                  (mysql--parse-prepare-ok conn prepare-ok))
+                                 '((:name "p"))))
+                (should-error (mysql--parse-prepare-ok conn prepare-ok)
+                              :type expected)))))))))
+
 (ert-deftest mysql-test-result-parse-error-invalidates-connection ()
   "A structural error mid-response must make the stream unusable."
   (mysql-test--with-pipe-conn conn

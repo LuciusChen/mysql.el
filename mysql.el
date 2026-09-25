@@ -73,7 +73,6 @@
 (defconst mysql--cap-secure-connection    #x00008000)
 (defconst mysql--cap-ssl                  #x00000800)
 (defconst mysql--cap-plugin-auth          #x00080000)
-(defconst mysql--cap-deprecate-eof        #x01000000)
 
 ;;;; Server status flags
 
@@ -1262,20 +1261,18 @@ has no pending response, or cannot consume the response completely."
            (mysql-conn-process conn) (mysql-conn-buf conn))))
       (setf (mysql-conn-read-idle-timeout conn) old-timeout))))
 
-(defun mysql--read-column-definitions (conn col-count)
-  "Read COL-COUNT column definition packets from CONN.
-Returns a list of column plists.  Also consumes the EOF packet."
-  (let ((columns (cl-loop repeat col-count
-                          collect (mysql--parse-column-definition
-                                   (mysql--read-packet conn)))))
-    ;; Read EOF after columns (unless CLIENT_DEPRECATE_EOF)
-    (when (zerop (logand (mysql-conn-capability-flags conn)
-                        mysql--cap-deprecate-eof))
-      (let ((eof-packet (mysql--read-packet conn)))
-        (unless (eq (mysql--packet-type eof-packet) 'eof)
-          (signal 'mysql-protocol-error
-                  (list "Missing EOF packet after column definitions")))))
-    columns))
+(defun mysql--read-column-definitions (conn count)
+  "Read COUNT column definition packets from CONN and the EOF after them.
+Returns a list of column plists, or nil without reading when COUNT is 0."
+  (when (> count 0)
+    (prog1 (cl-loop repeat count
+                    collect (mysql--parse-column-definition
+                             (mysql--read-packet conn)))
+      ;; The client never sets CLIENT_DEPRECATE_EOF, so an EOF packet
+      ;; always follows the definitions.
+      (unless (eq (mysql--packet-type (mysql--read-packet conn)) 'eof)
+        (signal 'mysql-protocol-error
+                (list "Missing EOF packet after column definitions"))))))
 
 (defun mysql--read-text-rows (conn col-count columns)
   "Read text protocol rows from CONN until EOF.
@@ -1339,15 +1336,6 @@ CONN is a `mysql-conn' returned by `mysql-connect'."
   "A MySQL server-side prepared statement cursor."
   stmt columns exhausted-p)
 
-(defun mysql--read-definition-packets (conn count)
-  "Read COUNT column-definition packets from CONN, then consume the EOF.
-Returns a list of parsed definitions, or nil when COUNT is 0."
-  (when (> count 0)
-    (prog1 (cl-loop repeat count
-                    collect (mysql--parse-column-definition
-                             (mysql--read-packet conn)))
-      (mysql--read-packet conn)))) ;; EOF after definitions
-
 (defun mysql--parse-prepare-ok (conn packet)
   "Parse a COM_STMT_PREPARE_OK response from PACKET.
 Reads param and column definition packets from CONN.
@@ -1362,8 +1350,8 @@ Returns a `mysql-stmt'."
                               (ash (aref packet 6) 8)))
          (num-params (logior (aref packet 7)
                              (ash (aref packet 8) 8)))
-         (param-defs (mysql--read-definition-packets conn num-params))
-         (col-defs (mysql--read-definition-packets conn num-columns)))
+         (param-defs (mysql--read-column-definitions conn num-params))
+         (col-defs (mysql--read-column-definitions conn num-columns)))
     (make-mysql-stmt :conn conn
                      :id stmt-id
                      :param-count num-params
