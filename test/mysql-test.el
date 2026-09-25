@@ -30,6 +30,7 @@
 
 (require 'cl-lib)
 (require 'ert)
+(require 'hex-util)
 (require 'mysql)
 
 ;;;; Test configuration for live tests
@@ -106,11 +107,14 @@
                  '(1 . 4))))
 
 (ert-deftest mysql-test-lenenc-int-from-string-rejects-truncated ()
-  "Truncated length-encoded integers should signal `mysql-protocol-error'."
+  "Truncated or invalid length-encoded integers should signal an error.
+The NULL marker 0xFB and the ERR marker 0xFF do not start an integer."
   (dolist (packet (list ""
                         (unibyte-string #xfc #x01)
                         (unibyte-string #xfd #x01 #x02)
-                        (unibyte-string #xfe #x00 #x00 #x02 #x00)))
+                        (unibyte-string #xfe #x00 #x00 #x02 #x00)
+                        (unibyte-string #xfb)
+                        (unibyte-string #xff #x00 #x00)))
     (should-error (mysql--read-lenenc-int-from-string packet 0)
                   :type 'mysql-protocol-error)))
 
@@ -124,25 +128,24 @@
                  '("" . 1))))
 
 (ert-deftest mysql-test-auth-native-password ()
-  "Test mysql_native_password computation."
+  "Test mysql_native_password against a known-answer vector.
+Vector independently verified with Python's hashlib for password
+\"secret\" and salt \"12345678901234567890\"."
   ;; Empty password should return empty string
   (should (equal (mysql--auth-native-password "" "12345678901234567890") ""))
   (should (equal (mysql--auth-native-password nil "12345678901234567890") ""))
-  ;; Non-empty password returns 20 bytes
-  (let ((result (mysql--auth-native-password "secret" "12345678901234567890")))
-    (should (= (length result) 20))))
+  (should (equal (encode-hex-string
+                  (mysql--auth-native-password "secret" "12345678901234567890"))
+                 "0f8b9033e0897c0a8338ebe3dea9010dda47ab56")))
 
 (ert-deftest mysql-test-auth-caching-sha2-password ()
-  "Test caching_sha2_password computation."
+  "Test caching_sha2_password against a known-answer vector.
+Vector independently verified with Python's hashlib for password
+\"secret\" and salt \"12345678901234567890\"."
   (should (equal (mysql--auth-caching-sha2-password "" "12345678901234567890") ""))
-  (let ((result (mysql--auth-caching-sha2-password "secret" "12345678901234567890")))
-    (should (= (length result) 32))))
-
-(ert-deftest mysql-test-xor-strings ()
-  "Test XOR of two strings."
-  (should (equal (mysql--xor-strings (unibyte-string #xff #x00 #xaa)
-                                     (unibyte-string #xff #xff #x55))
-                 (unibyte-string #x00 #xff #xff))))
+  (should (equal (encode-hex-string
+                  (mysql--auth-caching-sha2-password "secret" "12345678901234567890"))
+                 "51ecd6dedbd34d5445c0a190d4f51acf0d23b94db66c91f3f789faa9193751cd")))
 
 (ert-deftest mysql-test-parse-ok-packet ()
   "Test OK packet parsing."
@@ -176,13 +179,36 @@
   (should (eq (mysql--packet-type (unibyte-string #xfb)) 'local-infile))
   (should (eq (mysql--packet-type (unibyte-string #x03 #x01 #x02)) 'data)))
 
-(ert-deftest mysql-test-parse-value ()
-  "Test MySQL type conversion."
-  (should (= (mysql--parse-value "42" mysql-type-long) 42))
-  (should (= (mysql--parse-value "3.14" mysql-type-float) 3.14))
-  (should (= (mysql--parse-value "2024" mysql-type-year) 2024))
-  (should (equal (mysql--parse-value "hello" mysql-type-var-string) "hello"))
-  (should (null (mysql--parse-value nil mysql-type-long))))
+(ert-deftest mysql-test-parse-value-dispatches-by-type ()
+  "`mysql--parse-value' dispatches every scalar and date/time type correctly."
+  (dolist (case (list (list "42" mysql-type-long 42)
+                      (list "3.14" mysql-type-float 3.14)
+                      (list "2024" mysql-type-year 2024)
+                      (list "hello" mysql-type-var-string "hello")
+                      (list nil mysql-type-long nil)
+                      (list "2024-03-15" mysql-type-date
+                            '(:year 2024 :month 3 :day 15))
+                      (list "0000-00-00" mysql-type-date nil)
+                      (list "" mysql-type-date nil)
+                      (list "13:45:30" mysql-type-time
+                            '(:hours 13 :minutes 45 :seconds 30 :negative nil))
+                      (list "-02:30:00" mysql-type-time
+                            '(:hours 2 :minutes 30 :seconds 0 :negative t))
+                      (list "" mysql-type-time nil)
+                      (list "2024-03-15 13:45:30" mysql-type-datetime
+                            '(:year 2024 :month 3 :day 15
+                              :hours 13 :minutes 45 :seconds 30))
+                      (list "2024-01-01 00:00:00.123456" mysql-type-datetime
+                            '(:year 2024 :month 1 :day 1
+                              :hours 0 :minutes 0 :seconds 0))
+                      (list "0000-00-00 00:00:00" mysql-type-datetime nil)
+                      (list "" mysql-type-datetime nil)
+                      (list "2024-03-15 13:45:30" mysql-type-timestamp
+                            '(:year 2024 :month 3 :day 15
+                              :hours 13 :minutes 45 :seconds 30))))
+    (pcase-let ((`(,value ,type ,expected) case))
+      (ert-info ((format "value: %S type: %S" value type))
+        (should (equal (mysql--parse-value value type) expected))))))
 
 (ert-deftest mysql-test-parse-value-decimal-stays-exact ()
   "DECIMAL survives as its exact digit string in both protocols.
@@ -190,8 +216,7 @@ The type exists to keep values a float cannot represent."
   (let ((digits "1234567890123456789.123456789"))
     (should (equal (mysql--parse-value digits mysql-type-newdecimal) digits))
     (should (equal (mysql--parse-value digits mysql-type-decimal) digits))
-    (should (equal (mysql--binary-text-value
-                    digits (list :type mysql-type-newdecimal))
+    (should (equal (mysql--parse-typed-value digits mysql-type-newdecimal)
                    digits))))
 
 (ert-deftest mysql-test-parse-value-binary-columns-keep-bytes ()
@@ -222,32 +247,6 @@ cannot round-trip."
 
 ;;;; Extended type system tests
 
-(ert-deftest mysql-test-parse-date ()
-  "Test DATE string parsing."
-  (should (equal (mysql--parse-date "2024-03-15")
-                 '(:year 2024 :month 3 :day 15)))
-  (should (null (mysql--parse-date "0000-00-00")))
-  (should (null (mysql--parse-date ""))))
-
-(ert-deftest mysql-test-parse-time ()
-  "Test TIME string parsing."
-  (should (equal (mysql--parse-time "13:45:30")
-                 '(:hours 13 :minutes 45 :seconds 30 :negative nil)))
-  (should (equal (mysql--parse-time "-02:30:00")
-                 '(:hours 2 :minutes 30 :seconds 0 :negative t)))
-  (should (null (mysql--parse-time ""))))
-
-(ert-deftest mysql-test-parse-datetime ()
-  "Test DATETIME/TIMESTAMP string parsing."
-  (should (equal (mysql--parse-datetime "2024-03-15 13:45:30")
-                 '(:year 2024 :month 3 :day 15
-                   :hours 13 :minutes 45 :seconds 30)))
-  (should (equal (mysql--parse-datetime "2024-01-01 00:00:00.123456")
-                 '(:year 2024 :month 1 :day 1
-                   :hours 0 :minutes 0 :seconds 0)))
-  (should (null (mysql--parse-datetime "0000-00-00 00:00:00")))
-  (should (null (mysql--parse-datetime ""))))
-
 (ert-deftest mysql-test-parse-bit ()
   "Test BIT binary string parsing."
   (should (= (mysql--parse-bit (unibyte-string #x01)) 1))
@@ -261,19 +260,6 @@ cannot round-trip."
     (should (equal (mysql--parse-value "42" mysql-type-long) "custom:42")))
   ;; Without override, original behavior
   (should (= (mysql--parse-value "42" mysql-type-long) 42)))
-
-(ert-deftest mysql-test-parse-value-date-types ()
-  "Test that parse-value dispatches date/time types correctly."
-  (should (equal (mysql--parse-value "2024-03-15" mysql-type-date)
-                 '(:year 2024 :month 3 :day 15)))
-  (should (equal (mysql--parse-value "13:45:30" mysql-type-time)
-                 '(:hours 13 :minutes 45 :seconds 30 :negative nil)))
-  (should (equal (mysql--parse-value "2024-03-15 13:45:30" mysql-type-datetime)
-                 '(:year 2024 :month 3 :day 15
-                   :hours 13 :minutes 45 :seconds 30)))
-  (should (equal (mysql--parse-value "2024-03-15 13:45:30" mysql-type-timestamp)
-                 '(:year 2024 :month 3 :day 15
-                   :hours 13 :minutes 45 :seconds 30))))
 
 ;;;; Convenience API unit tests
 
@@ -322,8 +308,8 @@ cannot round-trip."
     (should (mysql-autocommit-p conn))
     (should-not (mysql-in-transaction-p conn))))
 
-(ert-deftest mysql-test-set-autocommit-issues-sql ()
-  "Test that `mysql-set-autocommit' sends the expected SQL."
+(ert-deftest mysql-test-transaction-helpers-issue-sql ()
+  "Test that the autocommit/commit/rollback helpers send the expected SQL."
   (let ((conn (make-mysql-conn))
         (queries nil))
     (cl-letf (((symbol-function 'mysql-query)
@@ -331,23 +317,12 @@ cannot round-trip."
                  (push sql queries)
                  (make-mysql-result :status "OK"))))
       (mysql-set-autocommit conn nil)
-      (mysql-set-autocommit conn t))
-    (should (equal (nreverse queries)
-                   '("SET autocommit = 0"
-                     "SET autocommit = 1")))))
-
-(ert-deftest mysql-test-commit-and-rollback-issue-sql ()
-  "Test that `mysql-commit' and `mysql-rollback' send the expected SQL."
-  (let ((conn (make-mysql-conn))
-        (queries nil))
-    (cl-letf (((symbol-function 'mysql-query)
-               (lambda (_conn sql)
-                 (push sql queries)
-                 (make-mysql-result :status "OK"))))
+      (mysql-set-autocommit conn t)
       (mysql-commit conn)
       (mysql-rollback conn))
     (should (equal (nreverse queries)
-                   '("COMMIT" "ROLLBACK")))))
+                   '("SET autocommit = 0" "SET autocommit = 1"
+                     "COMMIT" "ROLLBACK")))))
 
 (ert-deftest mysql-test-client-capability-flags ()
   "Client flags should match implemented protocol paths."
@@ -691,14 +666,13 @@ rejects overlapping commands."
       (should-not packets))))
 
 (ert-deftest mysql-test-result-column-count ()
-  "Test result-set header column count decoding."
+  "Test result-set header column count decoding.
+Truncation is `mysql--read-lenenc-int-from-string' territory; that error
+path is covered by `mysql-test-lenenc-int-from-string-rejects-truncated'."
   (should (= (mysql--result-column-count (unibyte-string 3)) 3))
   (should (= (mysql--result-column-count
               (concat (unibyte-string #xfc) (mysql--int-le-bytes 260 2)))
-             260))
-  (should-error (mysql--result-column-count
-                 (unibyte-string #xfe #x00 #x00 #x02 #x00))
-                :type 'mysql-protocol-error))
+             260)))
 
 (ert-deftest mysql-test-result-eof-updates-transaction-state ()
   "Text and prepared results publish the final server transaction state."
@@ -1011,17 +985,15 @@ offsets and consumes nothing, which keeps the boundary case retryable."
     (should (= (mysql-conn-read-offset conn) 0))
     (should (= (mysql-conn-sequence-id conn) 9))))
 
-(ert-deftest mysql-test-drain-query-response-rejects-busy-connection ()
-  "Draining should not run while CONN is already busy."
-  (let ((conn (make-mysql-conn :busy t)))
-    (should-error (mysql-drain-query-response conn)
-                  :type 'mysql-error)
-    (should (mysql-conn-busy conn))))
-
-(ert-deftest mysql-test-drain-query-response-requires-pending-state ()
-  "Draining without an interrupted query should fail immediately."
-  (should-error (mysql-drain-query-response (make-mysql-conn))
-                :type 'mysql-error))
+(ert-deftest mysql-test-drain-query-response-rejects-invalid-preconditions ()
+  "Draining requires an idle CONN with an actual pending response."
+  (ert-info ("busy connection")
+    (let ((conn (make-mysql-conn :busy t)))
+      (should-error (mysql-drain-query-response conn) :type 'mysql-error)
+      (should (mysql-conn-busy conn))))
+  (ert-info ("no pending response")
+    (should-error (mysql-drain-query-response (make-mysql-conn))
+                  :type 'mysql-error)))
 
 (ert-deftest mysql-test-open-connection-does-not-force-plain-type ()
   "Socket setup should not force a process type and must install the sentinel."
@@ -1069,7 +1041,7 @@ collecting the tls argument of each auth attempt in call order."
   (declare (indent 2) (debug (form symbolp body)))
   `(let ((,tls-flags nil)
          (buffers nil))
-     (cl-letf (((symbol-function 'mysql--tls-available-p) (lambda () t))
+     (cl-letf (((symbol-function 'gnutls-available-p) (lambda () t))
                ((symbol-function 'mysql--open-connection)
                 (lambda (_host _port _timeout)
                   (let ((buf (generate-new-buffer " *mysql-test-auto-tls*")))
@@ -1122,20 +1094,16 @@ collecting the tls argument of each auth attempt in call order."
          :type 'mysql-auth-error)
         (should (equal auth-tls-flags '(nil)))))))
 
-(ert-deftest mysql-test-connect-rejects-conflicting-tls-and-ssl-mode ()
-  "Explicit TLS should conflict with ssl-mode disabled."
-  (should-error (mysql-connect :host "127.0.0.1" :port 3306
-                               :user "root" :password "pw"
-                               :database "mysql"
-                               :tls t :ssl-mode 'disabled)
-                :type 'mysql-connection-error))
-
-(ert-deftest mysql-test-connect-rejects-unknown-ssl-mode ()
-  "Unknown ssl-mode values should fail early."
-  (should-error (mysql-connect :host "127.0.0.1" :port 3306
-                               :user "root" :password "pw"
-                               :database "mysql" :ssl-mode 'required)
-                :type 'mysql-connection-error))
+(ert-deftest mysql-test-connect-rejects-invalid-tls-options ()
+  "Conflicting or unknown TLS options should fail before connecting."
+  (dolist (extra-args '((:tls t :ssl-mode disabled)
+                        (:ssl-mode required)))
+    (ert-info ((format "extra args: %s" extra-args))
+      (should-error (apply #'mysql-connect
+                           :host "127.0.0.1" :port 3306
+                           :user "root" :password "pw"
+                           :database "mysql" extra-args)
+                    :type 'mysql-connection-error))))
 
 ;;;; Protocol hardening regressions
 
@@ -1175,13 +1143,15 @@ collecting the tls argument of each auth attempt in call order."
   "BLOB wire types should still decode textual columns by character set."
   (let ((value (encode-coding-string "中文" 'utf-8)))
     (should
-     (equal (mysql--binary-text-value
-             value (list :type mysql-type-blob :flags 0 :character-set 45))
+     (equal (mysql--parse-typed-value
+             value mysql-type-blob
+             (list :type mysql-type-blob :flags 0 :character-set 45))
             "中文"))
     (should
-     (equal (mysql--binary-text-value
-             value (list :type mysql-type-blob :flags 0
-                         :character-set mysql--binary-character-set))
+     (equal (mysql--parse-typed-value
+             value mysql-type-blob
+             (list :type mysql-type-blob :flags 0
+                   :character-set mysql--binary-character-set))
             value))))
 
 (ert-deftest mysql-test-read-packet-rejects-sequence-mismatch ()
@@ -1245,24 +1215,47 @@ of those bytes, and the parser would read prose as a packet header."
                                     "caching_sha2_password")
        :type 'mysql-auth-error))))
 
+(ert-deftest mysql-test-prepare-ok-requires-eof-after-definitions ()
+  "PREPARE_OK definitions must be followed by an EOF packet."
+  (let ((prepare-ok (unibyte-string 0 1 0 0 0 0 0 1 0 0 0 0))) ; 1 param
+    (pcase-dolist (`(,label ,after-definition ,expected)
+                   `(("EOF" ,(unibyte-string #xfe 0 0 2 0) ok)
+                     ("row" ,(unibyte-string 1) mysql-protocol-error)))
+      (ert-info (label)
+        (mysql-test--with-pipe-conn conn
+          (let ((packets (list "definition" after-definition)))
+            (cl-letf (((symbol-function 'mysql--read-packet)
+                       (lambda (_conn) (pop packets)))
+                      ((symbol-function 'mysql--parse-column-definition)
+                       (lambda (_packet) '(:name "p"))))
+              (if (eq expected 'ok)
+                  (should (equal (mysql-stmt-param-definitions
+                                  (mysql--parse-prepare-ok conn prepare-ok))
+                                 '((:name "p"))))
+                (should-error (mysql--parse-prepare-ok conn prepare-ok)
+                              :type expected)))))))))
+
 (ert-deftest mysql-test-result-parse-error-invalidates-connection ()
   "A structural error mid-response must make the stream unusable."
   (mysql-test--with-pipe-conn conn
     (setf (mysql-conn-capability-flags conn) 0)
-    (cl-letf (((symbol-function 'mysql--read-packet)
+    (cl-letf (((symbol-function 'mysql--send-packet) #'ignore)
+              ((symbol-function 'mysql--read-packet)
                (lambda (_conn) (unibyte-string 1))))
-      (should-error (mysql--read-result-set conn (unibyte-string 1))))
+      (should-error (mysql-query conn "SELECT 1")))
     (should-not (mysql-live-p conn))
     (should-not (buffer-live-p (mysql-conn-buf conn)))))
 
 (ert-deftest mysql-test-binary-row-parse-error-invalidates-connection ()
   "A malformed prepared-row response must invalidate the stream."
   (mysql-test--with-pipe-conn conn
-    (cl-letf (((symbol-function 'mysql--read-packet)
-               (lambda (_conn) (unibyte-string 0 0))))
-      (should-error
-       (mysql--read-binary-rows-with-status
-        conn (list (list :type mysql-type-longlong :flags 0)))))
+    (let ((cursor (make-mysql-cursor
+                   :stmt (make-mysql-stmt :conn conn :id 1)
+                   :columns (list (list :type mysql-type-longlong :flags 0)))))
+      (cl-letf (((symbol-function 'mysql--send-packet) #'ignore)
+                ((symbol-function 'mysql--read-packet)
+                 (lambda (_conn) (unibyte-string 0 0))))
+        (should-error (mysql-fetch cursor 1))))
     (should-not (mysql-live-p conn))
     (should-not (buffer-live-p (mysql-conn-buf conn)))))
 
@@ -1600,130 +1593,85 @@ Skips unless both `mysql-test-password' and
       (should (stringp cipher))
       (should (not (string-empty-p cipher))))))
 
-(ert-deftest mysql-test-live-tls-query ()
+(ert-deftest mysql-test-live-tls-query-and-prepared ()
   :tags '(:mysql-live :mysql-tls)
-  "Test query execution over TLS."
+  "Test plain query execution and prepared statements over TLS."
   (mysql-test--with-tls-conn conn
-    (let ((result (mysql-query conn "SELECT 42 AS v, 'tls-ok' AS msg")))
-      (let ((row (car (mysql-result-rows result))))
+    (ert-info ("plain query")
+      (let* ((result (mysql-query conn "SELECT 42 AS v, 'tls-ok' AS msg"))
+             (row (car (mysql-result-rows result))))
         (should (= (car row) 42))
-        (should (equal (cadr row) "tls-ok"))))))
+        (should (equal (cadr row) "tls-ok"))))
+    (ert-info ("prepared statement")
+      (let ((stmt (mysql-prepare conn "SELECT ? + 1 AS v")))
+        (should (= (car (car (mysql-result-rows (mysql-execute stmt 99)))) 100))
+        (mysql-stmt-close stmt)))))
 
-(ert-deftest mysql-test-live-tls-prepared-statement ()
+(ert-deftest mysql-test-live-caching-sha2-full-auth-requires-tls ()
   :tags '(:mysql-live :mysql-tls)
-  "Test prepared statements over TLS."
-  (mysql-test--with-tls-conn conn
-    (let ((stmt (mysql-prepare conn "SELECT ? + 1 AS v")))
-      (let ((result (mysql-execute stmt 99)))
-        (should (= (car (car (mysql-result-rows result))) 100)))
-      (mysql-stmt-close stmt))))
-
-(ert-deftest mysql-test-live-tls-caching-sha2-full-auth ()
-  :tags '(:mysql-live :mysql-tls)
-  "Test caching_sha2_password full auth over TLS (auth switch path)."
+  "caching_sha2_password full auth succeeds over TLS, explicit or retried.
+Covers both the auth-switch path (explicit `:tls t') and the default
+connect's automatic TLS retry."
   (if (or (null mysql-test-password) (null mysql-test-tls-enabled))
       (ert-skip "Set mysql-test-password and mysql-test-tls-enabled for TLS tests")
-    (let ((mysql-tls-verify-server nil))
-      ;; Create a caching_sha2_password user and flush to force full auth
-      (let ((admin (mysql-connect :host mysql-test-host
-                                  :port mysql-test-port
-                                  :user mysql-test-user
-                                  :password mysql-test-password
-                                  :database mysql-test-database
-                                  :tls t)))
-        (unwind-protect
-            (progn
-              (condition-case nil
-                  (mysql-query admin "DROP USER '_mysql_el_sha2test'@'%'")
-                (mysql-query-error nil))
-              (condition-case err
-                  (mysql-query admin
-                    "CREATE USER '_mysql_el_sha2test'@'%' IDENTIFIED WITH caching_sha2_password BY 'testpw'")
-                (mysql-query-error
-                 (ert-skip (format "Server does not support caching_sha2_password: %s"
-                                   (cadr err)))))
-              (mysql-query admin "GRANT ALL ON *.* TO '_mysql_el_sha2test'@'%'")
-              (mysql-query admin "FLUSH PRIVILEGES"))
-          (mysql-disconnect admin)))
-      ;; Connect as the new user over TLS (full auth required)
-      (let ((conn (mysql-connect :host mysql-test-host
-                                 :port mysql-test-port
-                                 :user "_mysql_el_sha2test"
-                                 :password "testpw"
-                                 :database mysql-test-database
-                                 :tls t)))
-        (unwind-protect
-            (progn
-              (should (mysql-conn-tls conn))
-              (let ((result (mysql-query conn "SELECT CURRENT_USER()")))
-                (should (string-prefix-p "_mysql_el_sha2test"
-                                         (car (car (mysql-result-rows result)))))))
-          (mysql-disconnect conn)))
-      ;; Cleanup
-      (let ((admin (mysql-connect :host mysql-test-host
-                                  :port mysql-test-port
-                                  :user mysql-test-user
-                                  :password mysql-test-password
-                                  :database mysql-test-database
-                                  :tls t)))
-        (unwind-protect
-            (condition-case nil
-                (mysql-query admin "DROP USER '_mysql_el_sha2test'@'%'")
-              (mysql-query-error nil))
-          (mysql-disconnect admin))))))
-
-(ert-deftest mysql-test-live-default-connect-auto-tls-retry ()
-  :tags '(:mysql-live :mysql-tls)
-  "A default connect should retry caching_sha2 full auth over TLS."
-  (if (or (null mysql-test-password) (null mysql-test-tls-enabled))
-      (ert-skip "Set mysql-test-password and mysql-test-tls-enabled for TLS tests")
-    (let ((mysql-tls-verify-server nil)
-          (user "_mysql_el_autoretry")
-          (created nil))
-      (let ((admin (mysql-connect :host mysql-test-host
-                                  :port mysql-test-port
-                                  :user mysql-test-user
-                                  :password mysql-test-password
-                                  :database mysql-test-database
-                                  :tls t)))
-        (unwind-protect
-            (progn
-              (condition-case nil
-                  (mysql-query admin (format "DROP USER IF EXISTS '%s'@'%%'" user))
-                (mysql-query-error nil))
-              (condition-case err
+    (dolist (case '(("_mysql_el_sha2test" :explicit-tls)
+                    ("_mysql_el_autoretry" :default-retry)))
+      (pcase-let ((`(,user ,mode) case))
+        (ert-info ((format "mode: %s" mode))
+          (let ((mysql-tls-verify-server nil)
+                (created nil))
+            ;; Create a caching_sha2_password user and flush to force full auth.
+            (let ((admin (mysql-connect :host mysql-test-host
+                                        :port mysql-test-port
+                                        :user mysql-test-user
+                                        :password mysql-test-password
+                                        :database mysql-test-database
+                                        :tls t)))
+              (unwind-protect
                   (progn
-                    (mysql-query admin
-                      (format "CREATE USER '%s'@'%%' IDENTIFIED WITH caching_sha2_password BY 'testpw'" user))
-                    (mysql-query admin (format "GRANT ALL ON *.* TO '%s'@'%%'" user))
-                    (mysql-query admin "FLUSH PRIVILEGES")
-                    (setq created t))
-                (mysql-query-error
-                 (ert-skip (format "Server does not support caching_sha2_password: %s"
-                                   (cadr err))))))
-          (mysql-disconnect admin)))
-      (unwind-protect
-          (let ((conn (mysql-connect :host mysql-test-host
-                                     :port mysql-test-port
-                                     :user user
-                                     :password "testpw"
-                                     :database mysql-test-database)))
-            (should (mysql-conn-tls conn))
-            (let ((result (mysql-query conn "SELECT CURRENT_USER()")))
-              (should (string-prefix-p user
-                                       (car (car (mysql-result-rows result)))))))
-        (when created
-          (let ((admin (mysql-connect :host mysql-test-host
-                                      :port mysql-test-port
-                                      :user mysql-test-user
-                                      :password mysql-test-password
-                                      :database mysql-test-database
-                                      :tls t)))
+                    (condition-case nil
+                        (mysql-query admin (format "DROP USER IF EXISTS '%s'@'%%'" user))
+                      (mysql-query-error nil))
+                    (condition-case err
+                        (progn
+                          (mysql-query admin
+                            (format "CREATE USER '%s'@'%%' IDENTIFIED WITH caching_sha2_password BY 'testpw'" user))
+                          (mysql-query admin (format "GRANT ALL ON *.* TO '%s'@'%%'" user))
+                          (mysql-query admin "FLUSH PRIVILEGES")
+                          (setq created t))
+                      (mysql-query-error
+                       (ert-skip (format "Server does not support caching_sha2_password: %s"
+                                         (cadr err))))))
+                (mysql-disconnect admin)))
+            ;; Connect as the new user; :explicit-tls forces TLS up front,
+            ;; :default-retry relies on the default connect's auto-retry.
             (unwind-protect
-                (condition-case nil
-                    (mysql-query admin (format "DROP USER IF EXISTS '%s'@'%%'" user))
-                  (mysql-query-error nil))
-              (mysql-disconnect admin))))))))
+                (let ((conn (apply #'mysql-connect
+                                   :host mysql-test-host
+                                   :port mysql-test-port
+                                   :user user
+                                   :password "testpw"
+                                   :database mysql-test-database
+                                   (if (eq mode :explicit-tls) '(:tls t) nil))))
+                  (unwind-protect
+                      (progn
+                        (should (mysql-conn-tls conn))
+                        (let ((result (mysql-query conn "SELECT CURRENT_USER()")))
+                          (should (string-prefix-p user
+                                                   (car (car (mysql-result-rows result)))))))
+                    (mysql-disconnect conn)))
+              (when created
+                (let ((admin (mysql-connect :host mysql-test-host
+                                            :port mysql-test-port
+                                            :user mysql-test-user
+                                            :password mysql-test-password
+                                            :database mysql-test-database
+                                            :tls t)))
+                  (unwind-protect
+                      (condition-case nil
+                          (mysql-query admin (format "DROP USER IF EXISTS '%s'@'%%'" user))
+                        (mysql-query-error nil))
+                    (mysql-disconnect admin)))))))))))
 
 (ert-deftest mysql-test-execute-integer-boundaries ()
   "Prepared parameters preserve signed and unsigned 64-bit integers."
