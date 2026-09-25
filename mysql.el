@@ -331,20 +331,6 @@ Advances read-offset without deleting buffer content."
       (setf (mysql-conn-read-offset conn) (+ off n))
       str)))
 
-(defun mysql--read-byte (conn)
-  "Read a single byte from CONN, returning it as an integer."
-  (aref (mysql--read-bytes conn 1) 0))
-
-(defun mysql--read-int-le (conn n)
-  "Read a little-endian integer of N bytes from CONN."
-  (let ((bytes (mysql--read-bytes conn n))
-        (val 0)
-        (i 0))
-    (while (< i n)
-      (setq val (logior val (ash (aref bytes i) (* i 8))))
-      (setq i (1+ i)))
-    val))
-
 ;;;; Packet I/O
 
 (defun mysql--closed-connection-error ()
@@ -381,8 +367,9 @@ multiple 16 MB fragments."
               (message-bytes 0)
               (more t))
           (while more
-            (let* ((len (mysql--read-int-le conn 3))
-                   (seq (mysql--read-byte conn))
+            (let* ((header (mysql--read-bytes conn 4))
+                   (len (mysql--read-le-uint header 0 3))
+                   (seq (aref header 3))
                    (expected (mysql-conn-sequence-id conn)))
               (unless (= seq expected)
                 (signal 'mysql-protocol-error
@@ -646,12 +633,10 @@ Returns a plist with :affected-rows, :last-insert-id, :status-flags, :warnings."
   (pcase-let* ((`(,affected-rows . ,pos1) (mysql--read-lenenc-int-from-string packet 1))
                (`(,last-insert-id . ,pos) (mysql--read-lenenc-int-from-string packet pos1))
          (status-flags (when (< (1+ pos) (length packet))
-                         (prog1 (logior (aref packet pos)
-                                        (ash (aref packet (+ pos 1)) 8))
+                         (prog1 (mysql--read-le-uint packet pos 2)
                            (cl-incf pos 2))))
          (warnings (when (< (1+ pos) (length packet))
-                     (logior (aref packet pos)
-                             (ash (aref packet (+ pos 1)) 8)))))
+                     (mysql--read-le-uint packet pos 2))))
     (list :affected-rows affected-rows
           :last-insert-id last-insert-id
           :status-flags status-flags
@@ -660,17 +645,14 @@ Returns a plist with :affected-rows, :last-insert-id, :status-flags, :warnings."
 (defun mysql--parse-eof-packet (packet)
   "Parse an EOF_Packet from PACKET.
 Returns a plist with :warnings and :status-flags."
-  (list :warnings (when (<= 5 (length packet))
-                    (logior (aref packet 1)
-                            (ash (aref packet 2) 8)))
-        :status-flags (when (<= 5 (length packet))
-                        (logior (aref packet 3)
-                                (ash (aref packet 4) 8)))))
+  (when (<= 5 (length packet))
+    (list :warnings (mysql--read-le-uint packet 1 2)
+          :status-flags (mysql--read-le-uint packet 3 2))))
 
 (defun mysql--parse-err-packet (packet)
   "Parse an ERR_Packet from PACKET (first byte 0xFF already verified).
 Returns a plist with :code, :state, :message."
-  (let* ((code (logior (aref packet 1) (ash (aref packet 2) 8)))
+  (let* ((code (mysql--read-le-uint packet 1 2))
          (pos 3)
          state message)
     ;; SQL state marker '#' + 5-byte state (if CLIENT_PROTOCOL_41)
@@ -711,33 +693,19 @@ Returns (value . new-pos)."
   (when (>= pos (length str))
     (signal 'mysql-protocol-error
             (list "Truncated length-encoded integer")))
-  (let ((first (aref str pos)))
-    (cond
-     ((< first #xfb)
-      (cons first (1+ pos)))
-     ((= first #xfc)
-      (when (> (+ pos 3) (length str))
-        (signal 'mysql-protocol-error
-                (list "Truncated 2-byte length-encoded integer")))
-      (cons (logior (aref str (+ pos 1))
-                    (ash (aref str (+ pos 2)) 8))
-            (+ pos 3)))
-     ((= first #xfd)
-      (when (> (+ pos 4) (length str))
-        (signal 'mysql-protocol-error
-                (list "Truncated 3-byte length-encoded integer")))
-      (cons (logior (aref str (+ pos 1))
-                    (ash (aref str (+ pos 2)) 8)
-                    (ash (aref str (+ pos 3)) 16))
-            (+ pos 4)))
-     ((= first #xfe)
-      (when (> (+ pos 9) (length str))
-        (signal 'mysql-protocol-error
-                (list "Truncated 8-byte length-encoded integer")))
-      (let ((val 0))
-        (dotimes (i 8)
-          (setq val (logior val (ash (aref str (+ pos 1 i)) (* i 8)))))
-        (cons val (+ pos 9)))))))
+  (let* ((first (aref str pos))
+         (width (cond ((< first #xfb) 0)
+                      ((= first #xfc) 2)
+                      ((= first #xfd) 3)
+                      ((= first #xfe) 8)
+                      (t (signal 'mysql-protocol-error
+                                 (list (format "Invalid length-encoded integer prefix #x%x"
+                                               first)))))))
+    (when (> (+ pos 1 width) (length str))
+      (signal 'mysql-protocol-error
+              (list (format "Truncated %d-byte length-encoded integer" width))))
+    (cons (if (= width 0) first (mysql--read-le-uint str (1+ pos) width))
+          (+ pos 1 width))))
 
 (defun mysql--read-lenenc-string-from-string (str pos)
   "Read a length-encoded string from STR at POS.
@@ -757,13 +725,10 @@ Returns a plist with column metadata."
                                      (decode-coding-string str 'utf-8)))))
     ;; Fixed-length fields after 0x0c marker: offsets relative to pos+1
     (cl-incf pos 1)
-    (let ((character-set (logior (aref packet pos) (ash (aref packet (+ pos 1)) 8)))
-          (column-length (logior (aref packet (+ pos 2))
-                                 (ash (aref packet (+ pos 3)) 8)
-                                 (ash (aref packet (+ pos 4)) 16)
-                                 (ash (aref packet (+ pos 5)) 24)))
+    (let ((character-set (mysql--read-le-uint packet pos 2))
+          (column-length (mysql--read-le-uint packet (+ pos 2) 4))
           (column-type (aref packet (+ pos 6)))
-          (flags (logior (aref packet (+ pos 7)) (ash (aref packet (+ pos 8)) 8)))
+          (flags (mysql--read-le-uint packet (+ pos 7) 2))
           (decimals (aref packet (+ pos 9))))
       (pcase-let ((`(,catalog ,schema ,table ,org-table ,name ,org-name) strings))
         (list :catalog catalog :schema schema
@@ -1343,13 +1308,9 @@ Returns a `mysql-stmt'."
   (unless (= (aref packet 0) #x00)
     (signal 'mysql-protocol-error
             (list "Non-OK status in PREPARE response")))
-  (let* ((stmt-id (logior (aref packet 1) (ash (aref packet 2) 8)
-                          (ash (aref packet 3) 16)
-                          (ash (aref packet 4) 24)))
-         (num-columns (logior (aref packet 5)
-                              (ash (aref packet 6) 8)))
-         (num-params (logior (aref packet 7)
-                             (ash (aref packet 8) 8)))
+  (let* ((stmt-id (mysql--read-le-uint packet 1 4))
+         (num-columns (mysql--read-le-uint packet 5 2))
+         (num-params (mysql--read-le-uint packet 7 2))
          (param-defs (mysql--read-column-definitions conn num-params))
          (col-defs (mysql--read-column-definitions conn num-columns)))
     (make-mysql-stmt :conn conn
@@ -1383,11 +1344,7 @@ Integers are encoded as 8-byte LE; others as lenenc strings."
   (cond
    ((null value) "")
    ((integerp value)
-    (let ((bytes (make-string 8 0))
-          (v (if (< value 0) (+ (ash 1 64) value) value)))
-      (dotimes (i 8)
-        (aset bytes i (logand (ash v (* i -8)) #xff)))
-      bytes))
+    (mysql--int-le-bytes value 8))
    ((floatp value)
     (let ((s (number-to-string value)))
       (concat (mysql--lenenc-int-bytes (length s)) s)))
@@ -1697,11 +1654,7 @@ Returns (value . new-pos)."
 
 (defun mysql--ieee754-single-to-float (data offset)
   "Decode a 4-byte IEEE 754 single-precision float from DATA at OFFSET."
-  (let* ((b0 (aref data offset))
-         (b1 (aref data (+ offset 1)))
-         (b2 (aref data (+ offset 2)))
-         (b3 (aref data (+ offset 3)))
-         (bits (logior b0 (ash b1 8) (ash b2 16) (ash b3 24)))
+  (let* ((bits (mysql--read-le-uint data offset 4))
          (sign (if (zerop (logand bits #x80000000)) 1.0 -1.0))
          (exponent (logand (ash bits -23) #xff))
          (mantissa (logand bits #x7fffff)))
@@ -1756,7 +1709,7 @@ Returns (value . new-pos)."
     (pcase len
       (0 (cons nil pos))
       (4
-       (let ((year (logior (aref packet pos) (ash (aref packet (+ pos 1)) 8)))
+       (let ((year (mysql--read-le-uint packet pos 2))
              (month (aref packet (+ pos 2)))
              (day (aref packet (+ pos 3))))
          (cons (if (= type mysql-type-date)
@@ -1765,7 +1718,7 @@ Returns (value . new-pos)."
                        :hours 0 :minutes 0 :seconds 0))
                (+ pos 4))))
       ((or 7 11)
-       (let ((year (logior (aref packet pos) (ash (aref packet (+ pos 1)) 8)))
+       (let ((year (mysql--read-le-uint packet pos 2))
              (month (aref packet (+ pos 2)))
              (day (aref packet (+ pos 3)))
              (hours (aref packet (+ pos 4)))
@@ -1786,10 +1739,7 @@ Returns (value . new-pos)."
       ((or 8 12)
        (let ((negative (not (zerop (aref packet pos))))
              ;; days: 4 bytes LE (convert to hours)
-             (days (logior (aref packet (+ pos 1))
-                           (ash (aref packet (+ pos 2)) 8)
-                           (ash (aref packet (+ pos 3)) 16)
-                           (ash (aref packet (+ pos 4)) 24)))
+             (days (mysql--read-le-uint packet (1+ pos) 4))
              (hours (aref packet (+ pos 5)))
              (minutes (aref packet (+ pos 6)))
              (seconds (aref packet (+ pos 7))))

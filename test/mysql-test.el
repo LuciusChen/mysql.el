@@ -107,11 +107,14 @@
                  '(1 . 4))))
 
 (ert-deftest mysql-test-lenenc-int-from-string-rejects-truncated ()
-  "Truncated length-encoded integers should signal `mysql-protocol-error'."
+  "Truncated or invalid length-encoded integers should signal an error.
+The NULL marker 0xFB and the ERR marker 0xFF do not start an integer."
   (dolist (packet (list ""
                         (unibyte-string #xfc #x01)
                         (unibyte-string #xfd #x01 #x02)
-                        (unibyte-string #xfe #x00 #x00 #x02 #x00)))
+                        (unibyte-string #xfe #x00 #x00 #x02 #x00)
+                        (unibyte-string #xfb)
+                        (unibyte-string #xff #x00 #x00)))
     (should-error (mysql--read-lenenc-int-from-string packet 0)
                   :type 'mysql-protocol-error)))
 
