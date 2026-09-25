@@ -1062,6 +1062,10 @@ TCP connection wait."
 (defun mysql--handle-auth-switch (conn password packet)
   "Handle an AUTH_SWITCH_REQUEST in PACKET for CONN.
 Resend PASSWORD with the new plugin and continue authentication."
+  (when (= (length packet) 1)
+    ;; A lone 0xFE is the old-style request to switch to mysql_old_password.
+    (signal 'mysql-auth-error
+            (list "Unsupported auth plugin: mysql_old_password")))
   (let* ((pos 1)
          (nul-pos (cl-position 0 packet :start pos)))
     (unless (and nul-pos (> nul-pos pos))
