@@ -269,7 +269,7 @@ COMMAND-NAME is used in the busy-connection error message."
   (mysql--ensure-command-ready conn command-name)
   (setf (mysql-conn-busy conn) t
         (mysql-conn-response-bytes conn) 0)
-  (let (completed handled)
+  (let (synchronized)
     (unwind-protect
         (condition-case err
             ;; Bind throw-on-input to nil so that `while-no-input' (used by
@@ -277,26 +277,18 @@ COMMAND-NAME is used in the busy-connection error message."
             ;; mid-response.
             (prog1 (let ((throw-on-input nil))
                      (funcall fn))
-              (setq completed t))
+              (setq synchronized t))
           ;; Query and statement errors are signaled only after the ERR
           ;; or OK packet that carries them is fully consumed, so the
           ;; stream sits at a response boundary and the connection stays
           ;; usable.
           ((mysql-query-error mysql-stmt-error)
-           (setq handled t)
-           (signal (car err) (cdr err)))
-          (mysql-timeout
-           (setq handled t)
-           (mysql--handle-command-interruption conn)
-           (signal (car err) (cdr err)))
-          (quit
-           (setq handled t)
-           (mysql--handle-command-interruption conn)
+           (setq synchronized t)
            (signal (car err) (cdr err))))
-      ;; Any other unfinished exit -- a throw, or an error class that
-      ;; does not imply a synchronized stream -- goes through the same
-      ;; interruption decision: preserve at a boundary, close mid-parse.
-      (when (and (not completed) (not handled))
+      ;; Every other exit -- a timeout, quit, throw, or an error such as
+      ;; a malformed packet -- goes through the interruption decision:
+      ;; preserve at a boundary, close mid-parse.
+      (unless synchronized
         (mysql--handle-command-interruption conn))
       (setf (mysql-conn-busy conn) nil))))
 
@@ -1273,22 +1265,17 @@ has no pending response, or cannot consume the response completely."
 (defun mysql--read-column-definitions (conn col-count)
   "Read COL-COUNT column definition packets from CONN.
 Returns a list of column plists.  Also consumes the EOF packet."
-  (condition-case err
-      (let ((columns (cl-loop repeat col-count
-                              collect (mysql--parse-column-definition
-                                       (mysql--read-packet conn)))))
-        ;; Read EOF after columns (unless CLIENT_DEPRECATE_EOF)
-        (when (zerop (logand (mysql-conn-capability-flags conn)
-                            mysql--cap-deprecate-eof))
-          (let ((eof-packet (mysql--read-packet conn)))
-            (unless (eq (mysql--packet-type eof-packet) 'eof)
-              (signal 'mysql-protocol-error
-                      (list "Missing EOF packet after column definitions")))))
-        columns)
-    (error
-     (mysql--cleanup-connection-resources
-      (mysql-conn-process conn) (mysql-conn-buf conn))
-     (signal (car err) (cdr err)))))
+  (let ((columns (cl-loop repeat col-count
+                          collect (mysql--parse-column-definition
+                                   (mysql--read-packet conn)))))
+    ;; Read EOF after columns (unless CLIENT_DEPRECATE_EOF)
+    (when (zerop (logand (mysql-conn-capability-flags conn)
+                        mysql--cap-deprecate-eof))
+      (let ((eof-packet (mysql--read-packet conn)))
+        (unless (eq (mysql--packet-type eof-packet) 'eof)
+          (signal 'mysql-protocol-error
+                  (list "Missing EOF packet after column definitions")))))
+    columns))
 
 (defun mysql--read-text-rows (conn col-count columns)
   "Read text protocol rows from CONN until EOF.
@@ -1312,21 +1299,13 @@ COL-COUNT and COLUMNS guide parsing.  Returns rows in order."
 (defun mysql--read-result-set (conn first-packet)
   "Read a full result set from CONN.
 FIRST-PACKET contains the column-count.  Returns a `mysql-result'."
-  (condition-case err
-      (let* ((col-count (mysql--result-column-count first-packet))
-             (columns (mysql--read-column-definitions conn col-count))
-             (rows (mysql--read-text-rows conn col-count columns)))
-        (make-mysql-result
-         :connection conn
-         :columns columns
-         :rows rows))
-    (mysql-query-error
-     ;; ERR is a complete terminal response and leaves the stream aligned.
-     (signal (car err) (cdr err)))
-    (error
-     (mysql--cleanup-connection-resources
-      (mysql-conn-process conn) (mysql-conn-buf conn))
-     (signal (car err) (cdr err)))))
+  (let* ((col-count (mysql--result-column-count first-packet))
+         (columns (mysql--read-column-definitions conn col-count))
+         (rows (mysql--read-text-rows conn col-count columns)))
+    (make-mysql-result
+     :connection conn
+     :columns columns
+     :rows rows)))
 
 ;;;; Disconnect
 
@@ -1373,30 +1352,24 @@ Returns a list of parsed definitions, or nil when COUNT is 0."
   "Parse a COM_STMT_PREPARE_OK response from PACKET.
 Reads param and column definition packets from CONN.
 Returns a `mysql-stmt'."
-  (condition-case err
-      (progn
-        (unless (= (aref packet 0) #x00)
-          (signal 'mysql-protocol-error
-                  (list "Non-OK status in PREPARE response")))
-        (let* ((stmt-id (logior (aref packet 1) (ash (aref packet 2) 8)
-                                (ash (aref packet 3) 16)
-                                (ash (aref packet 4) 24)))
-               (num-columns (logior (aref packet 5)
-                                    (ash (aref packet 6) 8)))
-               (num-params (logior (aref packet 7)
-                                   (ash (aref packet 8) 8)))
-               (param-defs (mysql--read-definition-packets conn num-params))
-               (col-defs (mysql--read-definition-packets conn num-columns)))
-          (make-mysql-stmt :conn conn
-                           :id stmt-id
-                           :param-count num-params
-                           :column-count num-columns
-                           :param-definitions param-defs
-                           :column-definitions col-defs)))
-    (error
-     (mysql--cleanup-connection-resources
-      (mysql-conn-process conn) (mysql-conn-buf conn))
-     (signal (car err) (cdr err)))))
+  (unless (= (aref packet 0) #x00)
+    (signal 'mysql-protocol-error
+            (list "Non-OK status in PREPARE response")))
+  (let* ((stmt-id (logior (aref packet 1) (ash (aref packet 2) 8)
+                          (ash (aref packet 3) 16)
+                          (ash (aref packet 4) 24)))
+         (num-columns (logior (aref packet 5)
+                              (ash (aref packet 6) 8)))
+         (num-params (logior (aref packet 7)
+                             (ash (aref packet 8) 8)))
+         (param-defs (mysql--read-definition-packets conn num-params))
+         (col-defs (mysql--read-definition-packets conn num-columns)))
+    (make-mysql-stmt :conn conn
+                     :id stmt-id
+                     :param-count num-params
+                     :column-count num-columns
+                     :param-definitions param-defs
+                     :column-definitions col-defs)))
 
 (defun mysql--elisp-to-wire-type (value)
   "Map Elisp VALUE to a 2-byte MySQL type code (little-endian).
@@ -1629,49 +1602,34 @@ The prepared statement remains usable."
   "Read binary row packets from CONN until EOF.
 COLUMNS is the column-definition list.  Return a plist with :rows,
 :warnings, and :status-flags."
-  (condition-case err
-      (let (rows)
-        (cl-loop
-         (let ((row-packet (mysql--read-packet conn)))
-           (cond
-            ((and (= (aref row-packet 0) #xfe) (<= (length row-packet) 9))
-             (let ((eof-info (mysql--parse-eof-packet row-packet)))
-               (when-let* ((status (plist-get eof-info :status-flags)))
-                 (setf (mysql-conn-status-flags conn) status))
-               (cl-return (list :rows (nreverse rows)
-                                :warnings (plist-get eof-info :warnings)
-                                :status-flags (plist-get eof-info :status-flags)))))
-            ((= (aref row-packet 0) #xff)
-             (signal 'mysql-stmt-error
-                     (list (mysql--err-packet-message row-packet))))
-            (t
-             (push (mysql--parse-binary-row row-packet columns)
-                   rows))))))
-    (mysql-stmt-error
-     ;; A complete ERR packet leaves the command stream synchronized.
-     (signal (car err) (cdr err)))
-    (error
-     (mysql--cleanup-connection-resources
-      (mysql-conn-process conn) (mysql-conn-buf conn))
-     (signal (car err) (cdr err)))))
+  (let (rows)
+    (cl-loop
+     (let ((row-packet (mysql--read-packet conn)))
+       (cond
+        ((and (= (aref row-packet 0) #xfe) (<= (length row-packet) 9))
+         (let ((eof-info (mysql--parse-eof-packet row-packet)))
+           (when-let* ((status (plist-get eof-info :status-flags)))
+             (setf (mysql-conn-status-flags conn) status))
+           (cl-return (list :rows (nreverse rows)
+                            :warnings (plist-get eof-info :warnings)
+                            :status-flags (plist-get eof-info :status-flags)))))
+        ((= (aref row-packet 0) #xff)
+         (signal 'mysql-stmt-error
+                 (list (mysql--err-packet-message row-packet))))
+        (t
+         (push (mysql--parse-binary-row row-packet columns)
+               rows)))))))
 
 (defun mysql--read-binary-result-set (conn first-packet)
   "Read a binary protocol result set from CONN.
 FIRST-PACKET contains the column count.  Returns a `mysql-result'."
-  (condition-case err
-      (let* ((col-count (mysql--result-column-count first-packet))
-             (columns (mysql--read-column-definitions conn col-count)))
-        (make-mysql-result
-         :connection conn
-         :columns columns
-         :rows (plist-get (mysql--read-binary-rows-with-status conn columns) :rows)))
-    (mysql-stmt-error
-     ;; A server ERR packet terminates the response safely.
-     (signal (car err) (cdr err)))
-    (error
-     (mysql--cleanup-connection-resources
-      (mysql-conn-process conn) (mysql-conn-buf conn))
-     (signal (car err) (cdr err)))))
+  (let* ((col-count (mysql--result-column-count first-packet))
+         (columns (mysql--read-column-definitions conn col-count)))
+    (make-mysql-result
+     :connection conn
+     :columns columns
+     :rows (plist-get (mysql--read-binary-rows-with-status conn columns)
+                      :rows))))
 
 (defun mysql--binary-null-p (null-bitmap col-index)
   "Check if column COL-INDEX is NULL in NULL-BITMAP.

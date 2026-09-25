@@ -1216,20 +1216,23 @@ of those bytes, and the parser would read prose as a packet header."
   "A structural error mid-response must make the stream unusable."
   (mysql-test--with-pipe-conn conn
     (setf (mysql-conn-capability-flags conn) 0)
-    (cl-letf (((symbol-function 'mysql--read-packet)
+    (cl-letf (((symbol-function 'mysql--send-packet) #'ignore)
+              ((symbol-function 'mysql--read-packet)
                (lambda (_conn) (unibyte-string 1))))
-      (should-error (mysql--read-result-set conn (unibyte-string 1))))
+      (should-error (mysql-query conn "SELECT 1")))
     (should-not (mysql-live-p conn))
     (should-not (buffer-live-p (mysql-conn-buf conn)))))
 
 (ert-deftest mysql-test-binary-row-parse-error-invalidates-connection ()
   "A malformed prepared-row response must invalidate the stream."
   (mysql-test--with-pipe-conn conn
-    (cl-letf (((symbol-function 'mysql--read-packet)
-               (lambda (_conn) (unibyte-string 0 0))))
-      (should-error
-       (mysql--read-binary-rows-with-status
-        conn (list (list :type mysql-type-longlong :flags 0)))))
+    (let ((cursor (make-mysql-cursor
+                   :stmt (make-mysql-stmt :conn conn :id 1)
+                   :columns (list (list :type mysql-type-longlong :flags 0)))))
+      (cl-letf (((symbol-function 'mysql--send-packet) #'ignore)
+                ((symbol-function 'mysql--read-packet)
+                 (lambda (_conn) (unibyte-string 0 0))))
+        (should-error (mysql-fetch cursor 1))))
     (should-not (mysql-live-p conn))
     (should-not (buffer-live-p (mysql-conn-buf conn)))))
 
