@@ -1215,6 +1215,21 @@ of those bytes, and the parser would read prose as a packet header."
                                     "caching_sha2_password")
        :type 'mysql-auth-error))))
 
+(ert-deftest mysql-test-auth-switch-request-errors ()
+  "A lone 0xFE requests mysql_old_password; a switch without a name is malformed."
+  (pcase-dolist (`(,packet ,message)
+                 `((,(unibyte-string #xfe)
+                    "Unsupported auth plugin: mysql_old_password")
+                   (,(unibyte-string #xfe ?x)
+                    "Malformed authentication switch response")))
+    (cl-letf (((symbol-function 'mysql--read-packet)
+               (lambda (_conn) packet)))
+      (should (equal (should-error
+                      (mysql--handle-auth-response (make-mysql-conn) "pw" "salt"
+                                                   "mysql_native_password")
+                      :type 'mysql-auth-error)
+                     (list 'mysql-auth-error message))))))
+
 (ert-deftest mysql-test-prepare-ok-requires-eof-after-definitions ()
   "PREPARE_OK definitions must be followed by an EOF packet."
   (let ((prepare-ok (unibyte-string 0 1 0 0 0 0 0 1 0 0 0 0))) ; 1 param
