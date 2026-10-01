@@ -1360,7 +1360,14 @@ of those bytes, and the parser would read prose as a packet header."
         (mysql-test--feed conn (mysql-test--wire 1 (unibyte-string 0 3 0 2 0 0 0)))
         (mysql-test--run-due-timers)
         (should (= (length calls) 1))
-        (should (= (mysql-result-affected-rows (caar calls)) 3))))))
+        (should (= (mysql-result-affected-rows (caar calls)) 3))
+        ;; Closing the connection afterwards finds no query to finish.
+        (let ((process (mysql-conn-process conn)))
+          (process-put process 'mysql-conn conn)
+          (delete-process process)
+          (mysql--process-sentinel process "deleted\n"))
+        (mysql-test--run-due-timers)
+        (should (= (length calls) 1))))))
 
 (ert-deftest mysql-test-async-server-error-keeps-connection-usable ()
   "A server error should finish an asynchronous query and keep CONN usable."
