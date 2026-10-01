@@ -829,7 +829,7 @@ or nil for zero datetimes."
     result))
 
 (defun mysql--binary-string-column-p (column)
-  "Return non-nil when COLUMN stores bytes rather than encoded text.
+  "Return non-nil when COLUMN carries bytes rather than encoded text.
 Binary-ness comes from the column metadata: the binary character set, the
 BINARY column flag, or the GEOMETRY type.  Without metadata the column is
 treated as text."
