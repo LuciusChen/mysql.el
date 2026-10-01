@@ -1251,7 +1251,7 @@ Signals `mysql-error' if CONN is busy with another command."
        (mysql--handle-query-response conn packet)))))
 
 (defun mysql--packet-available-p (conn)
-  "Return non-nil when CONN's buffer holds a whole packet past its read offset.
+  "Return non-nil when CONN's buffer has a whole packet past its read offset.
 A fragment of #xFFFFFF bytes continues in the next one."
   (with-current-buffer (mysql-conn-buf conn)
     (let ((pos (+ (point-min) (mysql-conn-read-offset conn)))
