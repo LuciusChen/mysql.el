@@ -54,10 +54,12 @@ emacs -Q --batch --eval '(setq byte-compile-error-on-warn t)' \
 ```
 
 - Run checkdoc, which must print nothing, and package-lint, installed with
-  package.el:
+  package.el.  The checkdoc command turns on the imperative-verb check,
+  which Emacs 31 and later leave off by default:
 
 ```bash
 emacs -Q --batch --eval "(require 'checkdoc)" \
+  --eval '(setq checkdoc-verb-check-experimental-flag t)' \
   --eval '(checkdoc-file "mysql.el")'
 
 emacs -Q --batch --eval "(require 'package)" --eval "(package-initialize)" \
