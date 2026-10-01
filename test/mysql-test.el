@@ -649,20 +649,20 @@ rejects overlapping commands."
          (row (mysql--parse-result-row packet 2 types)))
     (should (equal row '(42 "hello")))))
 
-(ert-deftest mysql-test-read-text-rows-keeps-empty-string-row ()
+(ert-deftest mysql-test-query-response-keeps-empty-string-row ()
   "A row whose first column is an empty string is not an OK terminator."
   (let ((conn (make-mysql-conn))
-        (packets (list (unibyte-string #x00)
-                       (unibyte-string #xfe #x00 #x00 #x02 #x00)))
-        (read-count 0))
+        (packets (list "definition"
+                       (unibyte-string #xfe #x00 #x00 #x02 #x00)
+                       (unibyte-string #x00)
+                       (unibyte-string #xfe #x00 #x00 #x02 #x00))))
     (cl-letf (((symbol-function 'mysql--read-packet)
-               (lambda (_conn)
-                 (cl-incf read-count)
-                 (pop packets))))
-      (should (equal (mysql--read-text-rows
-                      conn 1 (list (list :type mysql-type-var-string)))
+               (lambda (_conn) (pop packets)))
+              ((symbol-function 'mysql--parse-column-definition)
+               (lambda (_packet) (list :type mysql-type-var-string))))
+      (should (equal (mysql-result-rows
+                      (mysql--handle-query-response conn (unibyte-string 1)))
                      '((""))))
-      (should (= read-count 2))
       (should-not packets))))
 
 (ert-deftest mysql-test-result-column-count ()
@@ -684,6 +684,9 @@ path is covered by `mysql-test-lenenc-int-from-string-rejects-truncated'."
         (dolist (status '(1 0 2 3 2))
           (let ((packets
                  (append (list (unibyte-string 1))
+                         ;; Text results read their definitions one by one.
+                         (unless binary
+                           (list "definition" (unibyte-string #xfe 0 0 2 0)))
                          (when with-row
                            (list (if binary (unibyte-string 0 0 42 0 0 0)
                                    (unibyte-string 2 ?4 ?2))))
@@ -692,7 +695,9 @@ path is covered by `mysql-test-lenenc-int-from-string-rejects-truncated'."
                       ((symbol-function 'mysql--read-packet)
                        (lambda (_conn) (pop packets)))
                       ((symbol-function 'mysql--read-column-definitions)
-                       (lambda (_conn _count) columns)))
+                       (lambda (_conn _count) columns))
+                      ((symbol-function 'mysql--parse-column-definition)
+                       (lambda (_packet) (car columns))))
               (let ((result (if binary (mysql-execute stmt)
                               (mysql-query conn "SELECT id FROM items"))))
                 (should (equal (mysql-result-rows result)
@@ -1046,7 +1051,9 @@ collecting the tls argument of each auth attempt in call order."
                 (lambda (_host _port _timeout)
                   (let ((buf (generate-new-buffer " *mysql-test-auto-tls*")))
                     (push buf buffers)
-                    (cons (gensym "proc") buf))))
+                    (cons (make-pipe-process :name "mysql-test-auto-tls"
+                                             :buffer buf :noquery t)
+                          buf))))
                ((symbol-function 'mysql--authenticate)
                 (lambda (conn password tls)
                   (push tls ,tls-flags)
@@ -1273,6 +1280,200 @@ of those bytes, and the parser would read prose as a packet header."
         (should-error (mysql-fetch cursor 1))))
     (should-not (mysql-live-p conn))
     (should-not (buffer-live-p (mysql-conn-buf conn)))))
+
+;;;; Asynchronous queries
+
+(defun mysql-test--wire (seq payload)
+  "Return PAYLOAD framed as a MySQL packet with sequence id SEQ."
+  (concat (mysql--int-le-bytes (length payload) 3) (unibyte-string seq) payload))
+
+(defun mysql-test--wire-response (packets)
+  "Frame PACKETS as a response whose sequence ids start at 1."
+  (let ((seq 0))
+    (mapconcat (lambda (packet) (mysql-test--wire (cl-incf seq) packet))
+               packets "")))
+
+(defun mysql-test--column-definition (name type)
+  "Return a column definition payload for column NAME of TYPE."
+  (concat (mapconcat (lambda (field) (concat (unibyte-string (length field)) field))
+                     (list "def" "" "" "" name name) "")
+          (unibyte-string #x0c)
+          (mysql--int-le-bytes 63 2)
+          (mysql--int-le-bytes 20 4)
+          (unibyte-string type)
+          (mysql--int-le-bytes 0 2)
+          (unibyte-string 0 0 0)))
+
+(defun mysql-test--feed (conn bytes)
+  "Append BYTES to CONN's input and advance it, as its process filter does."
+  (with-current-buffer (mysql-conn-buf conn)
+    (set-buffer-multibyte nil)
+    (goto-char (point-max))
+    (insert bytes))
+  (mysql--advance-async conn))
+
+(defun mysql-test--run-due-timers ()
+  "Run timers that are already due, such as asynchronous callbacks."
+  (accept-process-output nil 0.01))
+
+(defconst mysql-test--interrupted-err
+  (concat (unibyte-string #xff) (mysql--int-le-bytes 1317 2)
+          "#70100Query execution was interrupted")
+  "ERR packet payload of a query stopped by KILL QUERY.")
+
+(ert-deftest mysql-test-async-query-finishes-once-at-response-end ()
+  "An asynchronous query should finish once, when its response is complete."
+  (mysql-test--with-pipe-conn conn
+    (let (writes calls)
+      (cl-letf (((symbol-function 'process-send-string)
+                 (lambda (_process string) (push string writes))))
+        (should-not (mysql-query-async conn "SELECT 42 AS n"
+                                       (lambda (&rest outcome) (push outcome calls))))
+        (should (equal (apply #'concat (reverse writes))
+                       (mysql-test--wire 0 (concat (unibyte-string 3)
+                                                   "SELECT 42 AS n"))))
+        (should (mysql-busy-p conn))
+        (should (mysql-async-pending-p conn))
+        (let ((response (mysql-test--wire-response
+                         (list (unibyte-string 1)
+                               (mysql-test--column-definition "n" mysql-type-longlong)
+                               (unibyte-string #xfe 0 0 2 0)
+                               (unibyte-string 2 ?4 ?2)
+                               (unibyte-string #xfe 0 0 2 0)))))
+          ;; A response cut mid-packet waits for its remainder.
+          (mysql-test--feed conn (substring response 0 -3))
+          (mysql-test--run-due-timers)
+          (should-not calls)
+          (should (mysql-async-pending-p conn))
+          (mysql-test--feed conn (substring response -3))
+          (mysql-test--run-due-timers))
+        (should (= (length calls) 1))
+        (should-not (cadar calls))
+        (should (equal (mysql-result-rows (caar calls)) '((42))))
+        (should-not (mysql-busy-p conn))
+        (should-not (mysql-async-pending-p conn))
+        (should (mysql-live-p conn))
+        ;; An OK packet finishes the next query.
+        (setq calls nil)
+        (mysql-query-async conn "UPDATE t SET n = 1"
+                           (lambda (&rest outcome) (push outcome calls)))
+        (mysql-test--feed conn (mysql-test--wire 1 (unibyte-string 0 3 0 2 0 0 0)))
+        (mysql-test--run-due-timers)
+        (should (= (length calls) 1))
+        (should (= (mysql-result-affected-rows (caar calls)) 3))))))
+
+(ert-deftest mysql-test-async-server-error-keeps-connection-usable ()
+  "A server error should finish an asynchronous query and keep CONN usable."
+  (pcase-dolist (`(,label ,packets)
+                 `(("before a result" (,mysql-test--interrupted-err))
+                   ("among the rows"
+                    (,(unibyte-string 1)
+                     ,(mysql-test--column-definition "n" mysql-type-longlong)
+                     ,(unibyte-string #xfe 0 0 2 0)
+                     ,(unibyte-string 2 ?4 ?2)
+                     ,mysql-test--interrupted-err))))
+    (ert-info (label)
+      (mysql-test--with-pipe-conn conn
+        (let (calls)
+          (cl-letf (((symbol-function 'process-send-string) #'ignore))
+            (mysql-query-async conn "SELECT n FROM t"
+                               (lambda (&rest outcome) (push outcome calls)))
+            (mysql-test--feed conn (mysql-test--wire-response packets))
+            (mysql-test--run-due-timers))
+          (should (equal calls
+                         '((nil (mysql-query-error
+                                 "[1317] (70100) Query execution was interrupted")))))
+          (should (mysql-live-p conn))
+          (should-not (mysql-busy-p conn)))))))
+
+(ert-deftest mysql-test-async-query-refuses-overlapping-commands ()
+  "A pending asynchronous query should refuse later commands unsent."
+  (mysql-test--with-pipe-conn conn
+    (let (writes)
+      (cl-letf (((symbol-function 'process-send-string)
+                 (lambda (_process string) (push string writes))))
+        (mysql-query-async conn "SELECT SLEEP(5)" #'ignore)
+        (let ((sent (length writes)))
+          (should-error (mysql-query conn "SELECT 1") :type 'mysql-error)
+          (should-error (mysql-query-async conn "SELECT 1" #'ignore)
+                        :type 'mysql-error)
+          (should (= (length writes) sent)))
+        (should (mysql-async-pending-p conn))))))
+
+(ert-deftest mysql-test-async-query-without-response-end-closes-connection-once ()
+  "Losing the response should finish a pending query once and close CONN."
+  (pcase-dolist
+      (`(,label ,lose ,condition)
+       (list
+        (list "peer closed"
+              (lambda (conn)
+                (let ((process (mysql-conn-process conn)))
+                  (process-put process 'mysql-conn conn)
+                  (set-process-sentinel process #'mysql--process-sentinel)
+                  (delete-process process)
+                  (accept-process-output nil 0.05)))
+              'mysql-connection-error)
+        (list "caller disconnected" #'mysql-disconnect 'mysql-connection-error)
+        (list "malformed response"
+              (lambda (conn)
+                ;; The response must start at sequence id 1.
+                (mysql-test--feed conn (mysql-test--wire 7 (unibyte-string 1))))
+              'mysql-protocol-error)))
+    (ert-info (label)
+      (mysql-test--with-pipe-conn conn
+        (let (calls)
+          (cl-letf (((symbol-function 'process-send-string) #'ignore))
+            (mysql-query-async conn "SELECT 1"
+                               (lambda (&rest outcome) (push outcome calls)))
+            (funcall lose conn)
+            (mysql-disconnect conn)
+            (mysql-test--run-due-timers))
+          (should (= (length calls) 1))
+          (should-not (caar calls))
+          (should (eq (car (cadar calls)) condition))
+          (should-not (mysql-busy-p conn))
+          (should-not (mysql-live-p conn))
+          (should-not (buffer-live-p (mysql-conn-buf conn))))))))
+
+(ert-deftest mysql-test-async-query-cut-short-while-sending-closes-connection ()
+  "A send that fails or is quit should close CONN without a callback."
+  (pcase-dolist (`(,label ,condition)
+                 '(("send error" (file-error "Broken pipe"))
+                   ("quit" (quit))))
+    (ert-info (label)
+      (mysql-test--with-pipe-conn conn
+        (let (calls caught)
+          (cl-letf (((symbol-function 'process-send-string)
+                     (lambda (_process _string)
+                       (signal (car condition) (cdr condition)))))
+            (condition-case err
+                (mysql-query-async conn "SELECT 1"
+                                   (lambda (&rest outcome) (push outcome calls)))
+              ((error quit) (setq caught (car err))))
+            (mysql-test--run-due-timers))
+          (should (eq caught (car condition)))
+          (should-not calls)
+          (should-not (mysql-busy-p conn))
+          (should-not (mysql-async-pending-p conn))
+          (should-not (mysql-live-p conn)))))))
+
+(ert-deftest mysql-test-packet-availability-follows-fragments ()
+  "A packet is available only once every one of its fragments has arrived."
+  (mysql-test--with-pipe-conn conn
+    (setf (mysql-conn-sequence-id conn) 1)
+    (with-current-buffer (mysql-conn-buf conn)
+      (set-buffer-multibyte nil)
+      (insert (unibyte-string 5 0 0 1) "abc"))
+    (should-not (mysql--packet-available-p conn))
+    (with-current-buffer (mysql-conn-buf conn)
+      (insert "de" (unibyte-string #xff #xff #xff 2) (make-string #xffffff ?x)))
+    (should (mysql--packet-available-p conn))
+    (should (equal (mysql--read-packet conn) "abcde"))
+    ;; A full-size fragment continues in the next packet.
+    (should-not (mysql--packet-available-p conn))
+    (with-current-buffer (mysql-conn-buf conn)
+      (insert (unibyte-string 0 0 0 3)))
+    (should (mysql--packet-available-p conn))))
 
 ;;;; Live integration tests (require a running MySQL server)
 
@@ -1751,5 +1952,47 @@ connect's automatic TLS retry."
             (should (equal (mysql-result-rows (mysql-execute stmt value))
                            (list (list value)))))
         (mysql-stmt-close stmt)))))
+
+(defun mysql-test--await (predicate)
+  "Process input and timers until PREDICATE is non-nil, for at most 10 seconds."
+  (let ((deadline (+ (float-time) 10)))
+    (while (not (funcall predicate))
+      (when (> (float-time) deadline)
+        (ert-fail "Timed out waiting for an asynchronous query"))
+      (accept-process-output nil 0.05))))
+
+(ert-deftest mysql-test-live-async-query-returns-before-the-server-answers ()
+  :tags '(:mysql-live)
+  "An asynchronous query should return at once and leave timers running."
+  (mysql-test--with-conn conn
+    (let (outcome timer-saw-pending)
+      (mysql-query-async conn "SELECT SLEEP(0.5) AS slept"
+                         (lambda (result error) (setq outcome (list result error))))
+      (run-at-time 0.1 nil (lambda ()
+                             (setq timer-saw-pending (mysql-async-pending-p conn))))
+      (mysql-test--await (lambda () outcome))
+      (should timer-saw-pending)
+      (should-not (cadr outcome))
+      (should (equal (mysql-result-rows (car outcome)) '((0))))
+      (should (equal (mysql-result-rows (mysql-query conn "SELECT 1")) '((1)))))))
+
+(ert-deftest mysql-test-live-async-kill-query-reports-the-server-verdict ()
+  :tags '(:mysql-live)
+  "KILL QUERY should finish an asynchronous query with the server's error."
+  (mysql-test--with-conn conn
+    (mysql-test--with-conn killer
+      (let (outcome)
+        ;; A killed SLEEP() returns 1 instead of an error unless a derived
+        ;; table wraps it, on every server from MySQL 5.6 on.
+        (mysql-query-async conn "SELECT * FROM (SELECT SLEEP(30)) t"
+                           (lambda (result error) (setq outcome (list result error))))
+        (sleep-for 0.2)
+        (mysql-query killer (format "KILL QUERY %d" (mysql-connection-id conn)))
+        (mysql-test--await (lambda () outcome))
+        (should-not (car outcome))
+        (should (eq (car (cadr outcome)) 'mysql-query-error))
+        (should (string-prefix-p "[1317]" (cadr (cadr outcome))))
+        (should (equal (mysql-result-rows (mysql-query conn "SELECT 1"))
+                       '((1))))))))
 
 ;;; mysql-test.el ends here

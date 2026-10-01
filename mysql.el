@@ -4,7 +4,7 @@
 
 ;; Author: Lucius Chen <chenyh572@gmail.com>
 ;; Maintainer: Lucius Chen <chenyh572@gmail.com>
-;; Version: 0.2.4
+;; Version: 0.2.5
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: comm, data
 ;; URL: https://github.com/LuciusChen/mysql.el
@@ -190,7 +190,8 @@ also accepted."
   tls
   (busy nil)
   (response-pending nil)
-  (response-drainable nil))
+  (response-drainable nil)
+  (async-response nil))
 
 (cl-defstruct mysql-result
   "A MySQL query result."
@@ -213,6 +214,10 @@ also accepted."
 (defun mysql-busy-p (conn)
   "Return non-nil if MySQL CONN is running a command."
   (mysql-conn-busy conn))
+
+(defun mysql-async-pending-p (conn)
+  "Return non-nil while an asynchronous query on MySQL CONN awaits its response."
+  (and (mysql-conn-async-response conn) t))
 
 (defun mysql-connection-id (conn)
   "Return the MySQL server connection id for CONN."
@@ -978,9 +983,13 @@ PASSWORD is the plaintext password; TLS non-nil means upgrade to TLS first."
 The default sentinel inserts EVENT text into the process buffer at the
 process mark -- ahead of any unread server bytes -- so a final ERR
 packet sent just before the peer closed would parse as prose instead
-of protocol data."
+of protocol data.  An asynchronous query still waiting for its response
+fails."
   (unless (process-live-p process)
-    (process-put process 'mysql-error (string-trim event))))
+    (process-put process 'mysql-error (string-trim event))
+    (when-let* ((conn (process-get process 'mysql-conn)))
+      (mysql--finish-async
+       conn '(mysql-connection-error "Connection closed by server")))))
 
 (defun mysql--open-connection (host port &optional connect-timeout)
   "Open a raw TCP connection to HOST:PORT for MySQL.
@@ -1001,10 +1010,12 @@ Returns (PROCESS . BUFFER)."
                                            :coding 'binary))
           (set-process-coding-system proc 'binary 'binary)
           (set-process-filter proc
-                              (lambda (_proc data)
+                              (lambda (process data)
                                 (with-current-buffer buf
                                   (goto-char (point-max))
-                                  (insert data))))
+                                  (insert data))
+                                (when-let* ((conn (process-get process 'mysql-conn)))
+                                  (mysql--advance-async conn))))
           ;; The filter never advances the process mark, so the default
           ;; sentinel would insert close events before unread wire bytes.
           (set-process-sentinel proc #'mysql--process-sentinel)
@@ -1040,6 +1051,7 @@ TCP connection wait."
                                    :host host :port port
                                    :user user :database database
                                    :read-idle-timeout read-idle-timeout)))
+        (process-put proc 'mysql-conn conn)
         (condition-case err
             (let (authenticated)
               (unwind-protect
@@ -1153,22 +1165,77 @@ SALT is the nonce, AUTH-PLUGIN is the current auth plugin name."
      :last-insert-id (plist-get ok-info :last-insert-id)
      :warnings (plist-get ok-info :warnings))))
 
-(defun mysql--handle-query-response (conn packet)
-  "Dispatch on PACKET type and return a `mysql-result' for CONN."
-  (condition-case err
+(cl-defstruct (mysql--query-response
+               (:constructor mysql--make-query-response)
+               (:copier nil))
+  "Progress of one COM_QUERY response.
+CALLBACK is set only for an asynchronous query."
+  column-count columns types rows result error callback)
+
+(defun mysql--query-response-step (conn response packet)
+  "Advance COM_QUERY RESPONSE on CONN with PACKET.
+Return non-nil once RESPONSE holds its result or the server's error.
+A malformed packet signals."
+  (let ((count (mysql--query-response-column-count response)))
+    (cond
+     ((null count)
       (pcase (mysql--packet-type packet)
-        ('ok (mysql--ok-packet-result conn packet))
-        ('err
-         (signal 'mysql-query-error (list (mysql--err-packet-message packet))))
-        (_
-         ;; Result set: first byte is column_count (lenenc int)
-         (mysql--read-result-set conn packet)))
-    (mysql-query-error
-     (signal (car err) (cdr err)))
-    (error
-     (mysql--cleanup-connection-resources
-      (mysql-conn-process conn) (mysql-conn-buf conn))
-     (signal (car err) (cdr err)))))
+        ('ok (setf (mysql--query-response-result response)
+                   (mysql--ok-packet-result conn packet)))
+        ('err (setf (mysql--query-response-error response)
+                    (list 'mysql-query-error (mysql--err-packet-message packet))))
+        ;; Result set: first byte is column_count (lenenc int)
+        (_ (setf (mysql--query-response-column-count response)
+                 (mysql--result-column-count packet)))))
+     ((< (length (mysql--query-response-columns response)) count)
+      (push (mysql--parse-column-definition packet)
+            (mysql--query-response-columns response)))
+     ((null (mysql--query-response-types response))
+      (mysql--expect-definitions-eof packet)
+      (let ((columns (nreverse (mysql--query-response-columns response))))
+        (setf (mysql--query-response-columns response) columns
+              (mysql--query-response-types response) (vconcat columns))))
+     (t
+      (pcase (mysql--packet-type packet)
+        ('eof
+         (when-let* ((status (plist-get (mysql--parse-eof-packet packet)
+                                        :status-flags)))
+           (setf (mysql-conn-status-flags conn) status))
+         (setf (mysql--query-response-result response)
+               (make-mysql-result
+                :connection conn
+                :columns (mysql--query-response-columns response)
+                :rows (nreverse (mysql--query-response-rows response)))))
+        ('err (setf (mysql--query-response-error response)
+                    (list 'mysql-query-error (mysql--err-packet-message packet))))
+        (_ (push (mysql--parse-result-row
+                  packet count (mysql--query-response-types response))
+                 (mysql--query-response-rows response))))))
+    (or (mysql--query-response-result response)
+        (mysql--query-response-error response))))
+
+(defun mysql--handle-query-response (conn packet)
+  "Read the COM_QUERY response that begins with PACKET from CONN.
+Return its `mysql-result', or signal `mysql-query-error' once the
+server's error has been consumed, which leaves CONN usable.  Any other
+failure closes CONN."
+  (let ((response (mysql--make-query-response)))
+    (condition-case err
+        (while (not (mysql--query-response-step conn response packet))
+          (setq packet (mysql--read-packet conn)))
+      (error
+       (mysql--cleanup-connection-resources
+        (mysql-conn-process conn) (mysql-conn-buf conn))
+       (signal (car err) (cdr err))))
+    (if-let* ((server-error (mysql--query-response-error response)))
+        (signal (car server-error) (cdr server-error))
+      (mysql--query-response-result response))))
+
+(defun mysql--send-query (conn sql)
+  "Send SQL to CONN as a COM_QUERY command."
+  (setf (mysql-conn-sequence-id conn) 0)
+  (mysql--send-packet conn (concat (unibyte-string #x03)
+                                   (encode-coding-string sql 'utf-8))))
 
 (defun mysql-query (conn sql)
   "Execute SQL query on CONN and return a `mysql-result'.
@@ -1177,13 +1244,82 @@ Signals `mysql-error' if CONN is busy with another command."
   (mysql--run-command-response
    conn "query"
    (lambda ()
-     (setf (mysql-conn-sequence-id conn) 0)
-     (mysql--send-packet conn (concat (unibyte-string #x03)
-                                      (encode-coding-string sql 'utf-8)))
+     (mysql--send-query conn sql)
      (setf (mysql-conn-response-drainable conn) t)
      (let ((packet (mysql--read-packet conn)))
        (setf (mysql-conn-response-drainable conn) nil)
        (mysql--handle-query-response conn packet)))))
+
+(defun mysql--packet-available-p (conn)
+  "Return non-nil when CONN's buffer holds a whole packet past its read offset.
+A fragment of #xFFFFFF bytes continues in the next one."
+  (with-current-buffer (mysql-conn-buf conn)
+    (let ((pos (+ (point-min) (mysql-conn-read-offset conn)))
+          (state 'more))
+      (while (eq state 'more)
+        (setq state nil)
+        (when (<= (+ pos 4) (point-max))
+          (let ((len (mysql--read-le-uint
+                      (buffer-substring-no-properties pos (+ pos 3)) 0 3)))
+            (setq pos (+ pos 4 len))
+            (when (<= pos (point-max))
+              (setq state (if (= len #xffffff) 'more t))))))
+      (eq state t))))
+
+(defun mysql--finish-async (conn error)
+  "Finish CONN's asynchronous query, if one is pending.
+ERROR, when non-nil, is a condition after which CONN cannot be
+synchronized, so CONN is closed.  The callback runs from a timer,
+outside the process filter."
+  (when-let* ((response (mysql-conn-async-response conn)))
+    (setf (mysql-conn-async-response conn) nil
+          (mysql-conn-busy conn) nil)
+    (when error
+      (mysql--cleanup-connection-resources
+       (mysql-conn-process conn) (mysql-conn-buf conn)))
+    (run-at-time 0 nil (mysql--query-response-callback response)
+                 (and (not error) (mysql--query-response-result response))
+                 (or error (mysql--query-response-error response)))))
+
+(defun mysql--advance-async (conn)
+  "Feed the whole packets buffered on CONN to its asynchronous query."
+  (when-let* ((response (mysql-conn-async-response conn)))
+    (condition-case err
+        (while (and (mysql-conn-async-response conn)
+                    (mysql--packet-available-p conn))
+          (when (mysql--query-response-step
+                 conn response (mysql--read-packet conn))
+            (mysql--finish-async conn nil)))
+      (error (mysql--finish-async conn err)))))
+
+(defun mysql-query-async (conn sql callback)
+  "Start SQL on CONN and return nil without waiting for its response.
+CALLBACK is called exactly once, from a timer, with RESULT and ERROR.
+On success RESULT is a `mysql-result' and ERROR is nil.  Otherwise
+RESULT is nil and ERROR is an error condition: after a
+`mysql-query-error' CONN is usable, and after any other condition CONN
+is closed.  CONN stays busy until the callback is scheduled, so it is
+idle when CALLBACK runs.  KILL QUERY from another connection stops the
+query, which then completes with the server's verdict.  The read idle
+timeout does not apply.  When sending SQL fails or is quit, signal at
+once without calling CALLBACK; CONN is then closed."
+  (mysql--ensure-command-ready conn "query")
+  (setf (mysql-conn-busy conn) t
+        (mysql-conn-response-bytes conn) 0
+        (mysql-conn-async-response conn)
+        (mysql--make-query-response :callback callback))
+  (let (sent)
+    (unwind-protect
+        (progn
+          (mysql--send-query conn sql)
+          (setq sent t))
+      ;; A request cut short, even by a quit, may be partly sent.
+      (unless sent
+        (setf (mysql-conn-async-response conn) nil
+              (mysql-conn-busy conn) nil)
+        (mysql--cleanup-connection-resources
+         (mysql-conn-process conn) (mysql-conn-buf conn)))))
+  nil)
 
 (defun mysql-drain-query-response (conn &optional read-idle-timeout)
   "Read and discard one pending query response from CONN.
@@ -1230,6 +1366,14 @@ has no pending response, or cannot consume the response completely."
            (mysql-conn-process conn) (mysql-conn-buf conn))))
       (setf (mysql-conn-read-idle-timeout conn) old-timeout))))
 
+(defun mysql--expect-definitions-eof (packet)
+  "Signal `mysql-protocol-error' unless PACKET is an EOF packet.
+The client never sets CLIENT_DEPRECATE_EOF, so an EOF packet always
+follows column definitions."
+  (unless (eq (mysql--packet-type packet) 'eof)
+    (signal 'mysql-protocol-error
+            (list "Missing EOF packet after column definitions"))))
+
 (defun mysql--read-column-definitions (conn count)
   "Read COUNT column definition packets from CONN and the EOF after them.
 Returns a list of column plists, or nil without reading when COUNT is 0."
@@ -1237,56 +1381,26 @@ Returns a list of column plists, or nil without reading when COUNT is 0."
     (prog1 (cl-loop repeat count
                     collect (mysql--parse-column-definition
                              (mysql--read-packet conn)))
-      ;; The client never sets CLIENT_DEPRECATE_EOF, so an EOF packet
-      ;; always follows the definitions.
-      (unless (eq (mysql--packet-type (mysql--read-packet conn)) 'eof)
-        (signal 'mysql-protocol-error
-                (list "Missing EOF packet after column definitions"))))))
-
-(defun mysql--read-text-rows (conn col-count columns)
-  "Read text protocol rows from CONN until EOF.
-COL-COUNT and COLUMNS guide parsing.  Returns rows in order."
-  (let ((rows nil)
-        (type-vector (vconcat columns)))
-    (cl-loop
-     (let ((row-packet (mysql--read-packet conn)))
-       (pcase (mysql--packet-type row-packet)
-         ('eof
-          (when-let* ((status (plist-get (mysql--parse-eof-packet row-packet)
-                                         :status-flags)))
-            (setf (mysql-conn-status-flags conn) status))
-          (cl-return nil))
-         ('err
-          (signal 'mysql-query-error (list (mysql--err-packet-message row-packet))))
-         (_ (push (mysql--parse-result-row row-packet col-count type-vector)
-                  rows)))))
-    (nreverse rows)))
-
-(defun mysql--read-result-set (conn first-packet)
-  "Read a full result set from CONN.
-FIRST-PACKET contains the column-count.  Returns a `mysql-result'."
-  (let* ((col-count (mysql--result-column-count first-packet))
-         (columns (mysql--read-column-definitions conn col-count))
-         (rows (mysql--read-text-rows conn col-count columns)))
-    (make-mysql-result
-     :connection conn
-     :columns columns
-     :rows rows)))
+      (mysql--expect-definitions-eof (mysql--read-packet conn)))))
 
 ;;;; Disconnect
 
 (defun mysql-disconnect (conn)
   "Disconnect from MySQL server, sending COM_QUIT.
-CONN is a `mysql-conn' returned by `mysql-connect'."
+CONN is a `mysql-conn' returned by `mysql-connect'.  An asynchronous
+query still waiting for its response fails with a connection error."
   (when conn
-    (condition-case nil
-        (when (process-live-p (mysql-conn-process conn))
-          ;; Send COM_QUIT
-          (setf (mysql-conn-sequence-id conn) 0)
-          (mysql--send-packet conn (unibyte-string #x01)))
-      (mysql-connection-error nil))
-    (mysql--cleanup-connection-resources
-     (mysql-conn-process conn) (mysql-conn-buf conn))))
+    (if (mysql-async-pending-p conn)
+        ;; The wire is inside a response, so close without COM_QUIT.
+        (mysql--finish-async conn '(mysql-connection-error "Connection closed"))
+      (condition-case nil
+          (when (process-live-p (mysql-conn-process conn))
+            ;; Send COM_QUIT
+            (setf (mysql-conn-sequence-id conn) 0)
+            (mysql--send-packet conn (unibyte-string #x01)))
+        (mysql-connection-error nil))
+      (mysql--cleanup-connection-resources
+       (mysql-conn-process conn) (mysql-conn-buf conn)))))
 
 ;;;; Prepared statements
 

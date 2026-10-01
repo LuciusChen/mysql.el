@@ -19,6 +19,7 @@ classic MySQL protocol directly and does not shell out to the =mysql= CLI.
   =mysql-connection-id=, =mysql-current-database=, and =mysql-select-database=
 - Public response drain helper for clients that cancel a running query out of
   band: =mysql-drain-query-response=
+- Asynchronous text queries with =mysql-query-async= and =mysql-async-pending-p=
 - Percent-decoded =mysql://= connection URIs through =mysql-connect-uri=
 - Support for MySQL 5.6+, MySQL 8.x, and MariaDB 10.11
 
@@ -50,6 +51,18 @@ session state:
       (mysql-query conn "INSERT INTO demo(name) VALUES ('alice')")
       (mysql-commit conn))
   (mysql-set-autocommit conn t))
+#+end_src
+
+* Asynchronous queries
+
+=mysql-query-async= sends a text query and returns at once.  Its callback runs exactly once, from a timer, with the =mysql-result= and nil, or with nil and an error condition.  Until then the connection is busy and refuses other commands; =mysql-async-pending-p= reports whether a query is still waiting for its response.  After a =mysql-query-error= the connection stays usable, and after any other error it is closed.  The read idle timeout does not apply: to stop a query early, run =KILL QUERY= with its =mysql-connection-id= on another connection, and the callback receives the server's verdict.
+
+#+begin_src emacs-lisp
+(mysql-query-async conn "SELECT COUNT(*) FROM orders"
+                   (lambda (result error)
+                     (if error
+                         (message "Query failed: %s" (error-message-string error))
+                       (message "Rows: %S" (mysql-result-rows result)))))
 #+end_src
 
 * Timeout recovery
