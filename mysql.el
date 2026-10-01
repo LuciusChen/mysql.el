@@ -4,7 +4,7 @@
 
 ;; Author: Lucius Chen <chenyh572@gmail.com>
 ;; Maintainer: Lucius Chen <chenyh572@gmail.com>
-;; Version: 0.2.5
+;; Version: 0.2.4
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: comm, data
 ;; URL: https://github.com/LuciusChen/mysql.el
