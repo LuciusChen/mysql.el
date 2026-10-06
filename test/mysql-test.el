@@ -748,6 +748,42 @@ path is covered by `mysql-test-lenenc-int-from-string-rejects-truncated'."
     (should (= (mysql-connection-port conn) 3306))
     (should (equal (mysql-current-database conn) "test"))))
 
+(ert-deftest mysql-test-send-packet-uses-one-write-per-fragment ()
+  "Test one write per wire fragment, including empty terminators.
+Separate header/payload writes can incur a TCP delayed-ACK round trip per
+command.  Assert bytes and write counts rather than a wall-clock threshold."
+  (dolist (size '(0 3 16777215 16777216))
+    (let* ((payload (make-string size 97))
+           (conn (make-mysql-conn :sequence-id 255))
+           (expected-lengths (if (< size #xffffff)
+                                 (list size)
+                               (list #xffffff (- size #xffffff))))
+           writes)
+      (cl-letf (((symbol-function 'mysql--live-process) (lambda (_) 'wire))
+                ((symbol-function 'mysql--send-string)
+                 (lambda (proc bytes)
+                   (should (eq 'wire proc))
+                   (push bytes writes))))
+        (mysql--send-packet conn payload))
+      (setq writes (nreverse writes))
+      (should (= (length writes) (length expected-lengths)))
+      (let ((sequence 255)
+            (offset 0))
+        (cl-mapc
+         (lambda (packet size)
+           (should (= (+ 4 size) (length packet)))
+           (should (equal (substring packet 0 4)
+                          (unibyte-string (logand size 255)
+                                          (logand (ash size -8) 255)
+                                          (logand (ash size -16) 255)
+                                          sequence)))
+           (should (equal (substring packet 4)
+                          (substring payload offset (+ offset size))))
+           (cl-incf offset size)
+           (setq sequence (logand (1+ sequence) 255)))
+         writes expected-lengths)
+        (should (= sequence (mysql-conn-sequence-id conn)))))))
+
 (ert-deftest mysql-test-send-packet-reports-closed-connection ()
   "Sending on a closed process should signal `mysql-connection-error'."
   (let* ((proc (make-process :name "mysql-test-closed"
