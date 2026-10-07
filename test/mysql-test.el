@@ -809,6 +809,23 @@ path is covered by `mysql-test-lenenc-int-from-string-rejects-truncated'."
       (should (equal observed-sql "USE `app``db`"))
       (should (equal (mysql-current-database conn) "app`db")))))
 
+(ert-deftest mysql-test-refresh-current-database-records-what-the-server-says ()
+  "Refreshing should record the database that the server reports for CONN.
+A USE run through `mysql-query' moves CONN without changing the database
+that `mysql-current-database' returns.  NULL means no database."
+  (pcase-dolist (`(,reported ,expected) '(("app" "app") (nil nil)))
+    (let ((conn (make-mysql-conn :database "old"))
+          observed-sql)
+      (cl-letf (((symbol-function 'mysql-query)
+                 (lambda (mysql-conn sql)
+                   (should (eq mysql-conn conn))
+                   (setq observed-sql sql)
+                   (make-mysql-result :connection mysql-conn
+                                      :rows (list (list reported))))))
+        (should (equal (mysql-refresh-current-database conn) expected))
+        (should (equal observed-sql "SELECT DATABASE()"))
+        (should (equal (mysql-current-database conn) expected))))))
+
 (ert-deftest mysql-test-drain-query-response-restores-timeout-and-busy ()
   "Draining a response should mark CONN busy and restore its timeout."
   (let ((conn (make-mysql-conn :read-idle-timeout 30
@@ -1507,6 +1524,14 @@ Skips if `mysql-test-password' is nil."
     (should (mysql-conn-p conn))
     (should (mysql-conn-server-version conn))
     (should (> (mysql-conn-connection-id conn) 0))))
+
+(ert-deftest mysql-test-live-refresh-current-database-follows-use ()
+  :tags '(:mysql-live)
+  "A refresh should record the database a USE through `mysql-query' chose."
+  (mysql-test--with-conn conn
+    (mysql-query conn "USE information_schema")
+    (should (equal (mysql-refresh-current-database conn) "information_schema"))
+    (should (equal (mysql-current-database conn) "information_schema"))))
 
 (ert-deftest mysql-test-live-select ()
   :tags '(:mysql-live)

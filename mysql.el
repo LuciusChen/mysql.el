@@ -1956,6 +1956,14 @@ updated after the server accepts the `USE' command."
     (setf (mysql-conn-database conn) database)
     database))
 
+(defun mysql-refresh-current-database (conn)
+  "Record and return the server's current database for MySQL CONN.
+Return nil when CONN uses none.  A `USE' run through `mysql-query' moves
+CONN to another database without changing the one that
+`mysql-current-database' returns; this brings it up to date."
+  (setf (mysql-conn-database conn)
+        (caar (mysql-result-rows (mysql-query conn "SELECT DATABASE()")))))
+
 (defun mysql-escape-literal (value)
   "Escape VALUE for use as a MySQL string literal.
 Wraps in single quotes and escapes special characters."
