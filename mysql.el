@@ -939,7 +939,13 @@ original connection mode."
   "Perform the MySQL handshake and authentication sequence on CONN.
 PASSWORD is the plaintext password; TLS non-nil means upgrade to TLS first."
   (let* ((handshake-packet (mysql--read-packet conn))
-         (handshake-info (mysql--parse-handshake conn handshake-packet))
+         (handshake-info
+          (if (eq (mysql--packet-type handshake-packet) 'err)
+              ;; A server that refuses the connection outright, as with too
+              ;; many connections, sends an ERR in place of its handshake.
+              (signal 'mysql-connection-error
+                      (list (mysql--err-packet-message handshake-packet)))
+            (mysql--parse-handshake conn handshake-packet)))
          (salt (plist-get handshake-info :salt))
          (auth-plugin (plist-get handshake-info :auth-plugin)))
     (when tls
@@ -974,7 +980,10 @@ PASSWORD is the plaintext password; TLS non-nil means upgrade to TLS first."
         (accept-process-output proc (if deadline
                                         (min 0.05 (max 0.0 remaining))
                                       0.05))))
-    (unless (memq (process-status proc) '(open run))
+    ;; A server that refuses the session, as with too many connections,
+    ;; sends an ERR and closes, at times before the connection is seen
+    ;; open; authentication then reads that ERR.
+    (unless (memq (process-status proc) '(open run closed))
       (signal 'mysql-connection-error
               (list (format "Failed to connect to %s:%s" host port))))))
 
@@ -1071,6 +1080,19 @@ TCP connection wait."
                               :connect-timeout connect-timeout)
              (signal (car err) (cdr err)))))))))
 
+(defun mysql--signal-auth-refusal (packet prefix)
+  "Signal the ERR_Packet PACKET that answered authentication.
+A refusal of the credentials themselves, SQLSTATE class 28, signals
+`mysql-auth-error' with PREFIX before the server's message, and so does
+a PACKET without a SQLSTATE.  Any other refusal, such as an unknown
+database, a locked account or too many connections, signals
+`mysql-connection-error' with the message alone."
+  (let ((state (plist-get (mysql--parse-err-packet packet) :state))
+        (text (mysql--err-packet-message packet)))
+    (if (or (null state) (string-prefix-p "28" state))
+        (signal 'mysql-auth-error (list (concat prefix text)))
+      (signal 'mysql-connection-error (list text)))))
+
 (defun mysql--handle-auth-switch (conn password packet)
   "Handle an AUTH_SWITCH_REQUEST in PACKET for CONN.
 Resend PASSWORD with the new plugin and continue authentication."
@@ -1106,9 +1128,7 @@ using SALT and AUTH-PLUGIN."
           (let ((ok-info (mysql--parse-ok-packet ok-packet)))
             (setf (mysql-conn-status-flags conn) (plist-get ok-info :status-flags))))
          ('err
-          (signal 'mysql-auth-error
-                  (list (concat "Auth failed after fast-auth: "
-                                (mysql--err-packet-message ok-packet))))))))
+          (mysql--signal-auth-refusal ok-packet "Auth failed after fast-auth: ")))))
     (#x04
      ;; Full authentication required
      (if (mysql-conn-tls conn)
@@ -1141,9 +1161,7 @@ SALT is the nonce, AUTH-PLUGIN is the current auth plugin name."
        (let ((ok-info (mysql--parse-ok-packet packet)))
          (setf (mysql-conn-status-flags conn) (plist-get ok-info :status-flags))))
       (#xff
-       (signal 'mysql-auth-error
-               (list (concat "Authentication failed: "
-                             (mysql--err-packet-message packet)))))
+       (mysql--signal-auth-refusal packet "Authentication failed: "))
       (#xfe
        (mysql--handle-auth-switch conn password packet))
       (#x01
