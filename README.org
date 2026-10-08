@@ -16,7 +16,9 @@ classic MySQL protocol directly and does not shell out to the =mysql= CLI.
 - Public transaction helpers: =mysql-autocommit-p=, =mysql-in-transaction-p=,
   =mysql-set-autocommit=, =mysql-commit=, and =mysql-rollback=
 - Public connection state helpers: =mysql-live-p=, =mysql-busy-p=,
-  =mysql-connection-id=, =mysql-current-database=, and =mysql-select-database=
+  =mysql-connection-id=, =mysql-current-database=, =mysql-select-database=, and
+  =mysql-refresh-current-database=, which records the database a =USE= run
+  through =mysql-query= chose
 - Public response drain helper for clients that cancel a running query out of
   band: =mysql-drain-query-response=
 - Asynchronous text queries with =mysql-query-async= and =mysql-async-pending-p=

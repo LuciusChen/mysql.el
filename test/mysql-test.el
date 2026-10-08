@@ -845,6 +845,23 @@ command.  Assert bytes and write counts rather than a wall-clock threshold."
       (should (equal observed-sql "USE `app``db`"))
       (should (equal (mysql-current-database conn) "app`db")))))
 
+(ert-deftest mysql-test-refresh-current-database-records-what-the-server-says ()
+  "Refreshing should record the database that the server reports for CONN.
+A USE run through `mysql-query' moves CONN without changing the database
+that `mysql-current-database' returns.  NULL means no database."
+  (pcase-dolist (`(,reported ,expected) '(("app" "app") (nil nil)))
+    (let ((conn (make-mysql-conn :database "old"))
+          observed-sql)
+      (cl-letf (((symbol-function 'mysql-query)
+                 (lambda (mysql-conn sql)
+                   (should (eq mysql-conn conn))
+                   (setq observed-sql sql)
+                   (make-mysql-result :connection mysql-conn
+                                      :rows (list (list reported))))))
+        (should (equal (mysql-refresh-current-database conn) expected))
+        (should (equal observed-sql "SELECT DATABASE()"))
+        (should (equal (mysql-current-database conn) expected))))))
+
 (ert-deftest mysql-test-drain-query-response-restores-timeout-and-busy ()
   "Draining a response should mark CONN busy and restore its timeout."
   (let ((conn (make-mysql-conn :read-idle-timeout 30
@@ -1273,6 +1290,64 @@ of those bytes, and the parser would read prose as a packet header."
                       :type 'mysql-auth-error)
                      (list 'mysql-auth-error message))))))
 
+(ert-deftest mysql-test-auth-err-blames-credentials-only-for-sqlstate-28 ()
+  "An ERR answering authentication should be an auth error only for SQLSTATE 28.
+An unknown database, error 1049 with SQLSTATE 42000, came out as an
+authentication error, after a caching_sha2_password fast auth as \"Auth
+failed after fast-auth\", though the server had accepted the credentials."
+  (cl-flet ((err-packet (code state message)
+              (concat (unibyte-string #xff (logand code #xff) (ash code -8))
+                      "#" state message))
+            (condition-of (&rest packets)
+              (cl-letf (((symbol-function 'mysql--read-packet)
+                         (lambda (_conn) (pop packets))))
+                (condition-case err
+                    (mysql--handle-auth-response (make-mysql-conn) "pw" "salt"
+                                                 "caching_sha2_password")
+                  (mysql-error err)))))
+    (let ((denied (err-packet 1045 "28000" "Access denied for user 'u'@'h'"))
+          (unknown (err-packet 1049 "42000" "Unknown database 'nope'")))
+      (should (equal (condition-of denied)
+                     '(mysql-auth-error
+                       "Authentication failed: [1045] (28000) Access denied for user 'u'@'h'")))
+      (should (equal (condition-of unknown)
+                     '(mysql-connection-error "[1049] (42000) Unknown database 'nope'")))
+      (should (equal (condition-of (unibyte-string #x01 #x03) unknown)
+                     '(mysql-connection-error "[1049] (42000) Unknown database 'nope'")))
+      (should (equal (condition-of (unibyte-string #x01 #x03) denied)
+                     '(mysql-auth-error
+                       "Auth failed after fast-auth: [1045] (28000) Access denied for user 'u'@'h'")))
+      (should (equal (condition-of (concat (unibyte-string #xff #x15 #x04)
+                                           "Access denied"))
+                     '(mysql-auth-error "Authentication failed: [1045] Access denied"))))))
+
+(ert-deftest mysql-test-wait-for-connect-passes-a-connection-the-server-closed ()
+  "A connection the server closed at once should reach authentication.
+A server that refuses the session, as with too many connections, sends
+an ERR and closes, at times before Emacs sees the connection open; that
+ERR then gave way to \"Failed to connect\"."
+  (let ((statuses (list 'connect 'closed)))
+    (cl-letf (((symbol-function 'process-status)
+               (lambda (_proc)
+                 (if (cdr statuses) (pop statuses) (car statuses))))
+              ((symbol-function 'accept-process-output) #'ignore))
+      (should-not (mysql--wait-for-connect 'proc "127.0.0.1" 3306 10))))
+  (cl-letf (((symbol-function 'process-status) (lambda (_proc) 'failed)))
+    (should (equal (should-error (mysql--wait-for-connect 'proc "127.0.0.1" 3306 10)
+                                 :type 'mysql-connection-error)
+                   '(mysql-connection-error "Failed to connect to 127.0.0.1:3306")))))
+
+(ert-deftest mysql-test-handshake-err-is-a-connection-error ()
+  "An ERR in place of the server's handshake should be a connection error.
+A server that refuses the connection outright, as with too many
+connections, error 1040, sends it before the handshake and without a
+SQLSTATE; it was parsed as a handshake of protocol version 255."
+  (let ((refusal (concat (unibyte-string #xff #x10 #x04) "Too many connections")))
+    (cl-letf (((symbol-function 'mysql--read-packet) (lambda (_conn) refusal)))
+      (should (equal (should-error (mysql--authenticate (make-mysql-conn) "pw" nil)
+                                   :type 'mysql-connection-error)
+                     '(mysql-connection-error "[1040] Too many connections"))))))
+
 (ert-deftest mysql-test-prepare-ok-requires-eof-after-definitions ()
   "PREPARE_OK definitions must be followed by an EOF packet."
   (let ((prepare-ok (unibyte-string 0 1 0 0 0 0 0 1 0 0 0 0))) ; 1 param
@@ -1543,6 +1618,35 @@ Skips if `mysql-test-password' is nil."
     (should (mysql-conn-p conn))
     (should (mysql-conn-server-version conn))
     (should (> (mysql-conn-connection-id conn) 0))))
+
+(ert-deftest mysql-test-live-refresh-current-database-follows-use ()
+  :tags '(:mysql-live)
+  "A refresh should record the database a USE through `mysql-query' chose."
+  (mysql-test--with-conn conn
+    (mysql-query conn "USE information_schema")
+    (should (equal (mysql-refresh-current-database conn) "information_schema"))
+    (should (equal (mysql-current-database conn) "information_schema"))))
+
+(ert-deftest mysql-test-live-connect-tells-an-unknown-database-from-bad-credentials ()
+  :tags '(:mysql-live)
+  "Connecting to a missing database should not be reported as bad credentials.
+The server accepted the user and password and then refused the database,
+error 1049, but `mysql-connect' signaled an authentication error."
+  (if (null mysql-test-password)
+      (ert-skip "Set mysql-test-password to enable live tests")
+    (let ((mysql-tls-verify-server nil))
+      (cl-flet ((connect (password database)
+                  (mysql-connect :host mysql-test-host :port mysql-test-port
+                                 :user mysql-test-user :password password
+                                 :database database)))
+        (should (string-prefix-p
+                 "[1049]"
+                 (cadr (should-error (connect mysql-test-password
+                                              "mysql_el_no_such_database")
+                                     :type 'mysql-connection-error))))
+        (should-error (connect (concat mysql-test-password "-wrong")
+                               mysql-test-database)
+                      :type 'mysql-auth-error)))))
 
 (ert-deftest mysql-test-live-select ()
   :tags '(:mysql-live)
