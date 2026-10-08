@@ -445,17 +445,17 @@ Handles splitting payloads larger than 0xFFFFFF."
                             (unibyte-string (mysql-conn-sequence-id conn)))))
         (setf (mysql-conn-sequence-id conn)
               (logand (1+ (mysql-conn-sequence-id conn)) #xff))
-        (mysql--send-string proc header)
-        (mysql--send-string proc (substring payload offset (+ offset #xffffff)))
+        (mysql--send-string
+         proc (concat header (substring payload offset (+ offset #xffffff))))
         (cl-incf offset #xffffff)))
     (let* ((remaining (- total offset))
            (header (concat (mysql--int-le-bytes remaining 3)
                            (unibyte-string (mysql-conn-sequence-id conn)))))
       (setf (mysql-conn-sequence-id conn)
             (logand (1+ (mysql-conn-sequence-id conn)) #xff))
-      (mysql--send-string proc header)
-      (when (> remaining 0)
-        (mysql--send-string proc (substring payload offset))))))
+      ;; A separate short header write can wait for a delayed TCP ACK before
+      ;; the peer receives the payload.  Send each complete fragment at once.
+      (mysql--send-string proc (concat header (substring payload offset))))))
 
 ;;;; Authentication helpers
 
