@@ -92,5 +92,5 @@ emacs -Q --batch --eval "(require 'package)" --eval "(package-initialize)" \
 - Only a release changes `;; Version:` in `mysql.el`, moves the `Unreleased`
   entries under the new version, and is tagged `vX.Y.Z`.  Keep
   version-specific prose out of `README.org`.
-- MELPA builds `mysql` from `main`, so every merge reaches MELPA users.  No
-  version has been tagged yet.
+- MELPA builds `mysql` from `main`, so every merge reaches MELPA users; the
+  tags serve MELPA Stable.
