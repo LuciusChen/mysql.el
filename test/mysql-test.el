@@ -1956,6 +1956,27 @@ Skips unless both `mysql-test-password' and
       (should (stringp cipher))
       (should (not (string-empty-p cipher))))))
 
+(ert-deftest mysql-test-live-tls-untrusted-certificate-names-the-problem ()
+  :tags '(:mysql-live :mysql-tls)
+  "A certificate that fails verification is reported with GnuTLS's reason.
+MySQL's own certificates are self-signed, which nothing trusts by default."
+  (if (or (null mysql-test-password) (null mysql-test-tls-enabled))
+      (ert-skip "Set mysql-test-password and mysql-test-tls-enabled for TLS tests")
+    (let* ((mysql-tls-verify-server t)
+           (mysql-tls-trustfiles nil)
+           (err (condition-case err
+                    (progn
+                      (mysql-disconnect
+                       (mysql-connect :host mysql-test-host
+                                      :port mysql-test-port
+                                      :user mysql-test-user
+                                      :password mysql-test-password
+                                      :tls t))
+                      (ert-skip "The server's certificate is trusted"))
+                  (mysql-connection-error err))))
+      (should (string-match-p (regexp-quote mysql-test-host) (cadr err)))
+      (should (string-match-p "untrusted authority" (cadr err))))))
+
 (ert-deftest mysql-test-live-tls-query-and-prepared ()
   :tags '(:mysql-live :mysql-tls)
   "Test plain query execution and prepared statements over TLS."
