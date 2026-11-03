@@ -892,16 +892,32 @@ directly, so prepared-statement results are unaffected by overrides."
    (logior (mysql--client-capabilities conn) mysql--cap-ssl)))
 
 (defun mysql--upgrade-to-tls (conn)
-  "Upgrade CONN's network connection to TLS using GnuTLS."
+  "Upgrade CONN's network connection to TLS using GnuTLS.
+A certificate that fails verification signals `mysql-connection-error'
+with GnuTLS's reasons, since its own error names none."
   (let ((proc (mysql-conn-process conn)))
     (require 'gnutls)
-    (gnutls-negotiate
-     :process proc
-     :hostname (mysql-conn-host conn)
-     :trustfiles mysql-tls-trustfiles
-     :keylist mysql-tls-keylist
-     :verify-hostname-error mysql-tls-verify-server
-     :verify-error mysql-tls-verify-server)
+    (condition-case err
+        (gnutls-negotiate
+         :process proc
+         :hostname (mysql-conn-host conn)
+         :trustfiles mysql-tls-trustfiles
+         :keylist mysql-tls-keylist
+         :verify-hostname-error mysql-tls-verify-server
+         :verify-error mysql-tls-verify-server)
+      (gnutls-error
+       (let ((problems (and mysql-tls-verify-server
+                            (ignore-errors
+                              (mapcar #'gnutls-peer-status-warning-describe
+                                      (plist-get (gnutls-peer-status proc)
+                                                 :warnings))))))
+         (if problems
+             (signal 'mysql-connection-error
+                     (list (format "TLS certificate of %s was not accepted: %s; \
+`mysql-tls-trustfiles' and `mysql-tls-verify-server' control verification"
+                                   (mysql-conn-host conn)
+                                   (string-join problems "; "))))
+           (signal (car err) (cdr err))))))
     (setf (mysql-conn-tls conn) t)))
 
 (defun mysql--cleanup-connection-resources (proc buf)
