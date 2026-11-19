@@ -669,10 +669,10 @@ Returns a plist with :code, :state, :message."
     (setq message (decode-coding-string (substring packet pos) 'utf-8))
     (list :code code :state state :message message)))
 
-(defun mysql--err-packet-message (packet)
-  "Return a \"[code] (state) message\" string describing ERR_Packet PACKET.
-The \"(state)\" segment is included only when PACKET carries a SQL state."
-  (let* ((err-info (mysql--parse-err-packet packet))
+(defun mysql--err-packet-message (packet &optional err-info)
+  "Format ERR_Packet PACKET, reusing ERR-INFO if already parsed.
+Include the SQLSTATE only when present."
+  (let* ((err-info (or err-info (mysql--parse-err-packet packet)))
          (state (plist-get err-info :state)))
     (format "[%d] %s%s"
             (plist-get err-info :code)
@@ -1103,8 +1103,9 @@ A refusal of the credentials themselves, SQLSTATE class 28, signals
 a PACKET without a SQLSTATE.  Any other refusal, such as an unknown
 database, a locked account or too many connections, signals
 `mysql-connection-error' with the message alone."
-  (let ((state (plist-get (mysql--parse-err-packet packet) :state))
-        (text (mysql--err-packet-message packet)))
+  (let* ((err-info (mysql--parse-err-packet packet))
+         (state (plist-get err-info :state))
+         (text (mysql--err-packet-message packet err-info)))
     (if (or (null state) (string-prefix-p "28" state))
         (signal 'mysql-auth-error (list (concat prefix text)))
       (signal 'mysql-connection-error (list text)))))
