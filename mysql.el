@@ -165,9 +165,6 @@ also accepted."
 (defconst mysql--column-flag-unsigned #x20
   "MySQL UNSIGNED_FLAG column metadata bit.")
 
-(defconst mysql--column-flag-binary #x80
-  "MySQL BINARY_FLAG column metadata bit.")
-
 (defconst mysql--binary-character-set 63
   "MySQL binary character set number.")
 
@@ -834,16 +831,9 @@ or nil for zero datetimes."
     result))
 
 (defun mysql--binary-string-column-p (column)
-  "Return non-nil when COLUMN carries bytes rather than encoded text.
-Binary-ness comes from the column metadata: the binary character set, the
-BINARY column flag, or the GEOMETRY type.  Without metadata the column is
-treated as text."
-  (let ((type (plist-get column :type))
-        (flags (or (plist-get column :flags) 0))
-        (character-set (plist-get column :character-set)))
-    (or (and character-set (= character-set mysql--binary-character-set))
-        (not (zerop (logand flags mysql--column-flag-binary)))
-        (and type (= type mysql-type-geometry)))))
+  "Return non-nil for a binary character set or GEOMETRY in COLUMN."
+  (or (eql (plist-get column :character-set) mysql--binary-character-set)
+      (eql (plist-get column :type) mysql-type-geometry)))
 
 (defun mysql--parse-typed-value (value type &optional column)
   "Parse non-null string VALUE according to MySQL column TYPE code.

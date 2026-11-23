@@ -2,6 +2,12 @@
 
 Notable user-visible changes are recorded here.
 
+## Unreleased
+
+### Fixed
+
+- Text columns with a binary collation now decode as text. Binary strings and GEOMETRY still return their original bytes.
+
 ## 0.2.5 - 2026-11-03
 
 ### Added

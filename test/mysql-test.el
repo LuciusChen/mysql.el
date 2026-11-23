@@ -228,16 +228,17 @@ cannot round-trip."
     (should (equal (mysql--parse-value
                     bytes (list :type mysql-type-blob
                                 :character-set mysql--binary-character-set
-                                :flags mysql--column-flag-binary))
+                                :flags #x80))
                    bytes))
     ;; GEOMETRY is bytes regardless of metadata beyond its type.
     (should (equal (mysql--parse-value
                     bytes (list :type mysql-type-geometry))
                    bytes))
-    ;; A text column still decodes.
+    ;; A binary collation on a text column still decodes.
     (should (equal (mysql--parse-value
                     (encode-coding-string "héllo" 'utf-8)
-                    (list :type mysql-type-var-string :character-set 224))
+                    (list :type mysql-type-var-string :character-set 45
+                          :flags #x80))
                    "héllo"))
     ;; Without metadata, bare type codes keep decoding as text.
     (should (equal (mysql--parse-value
@@ -1205,7 +1206,7 @@ collecting the tls argument of each auth attempt in call order."
     (should
      (equal (mysql--parse-typed-value
              value mysql-type-blob
-             (list :type mysql-type-blob :flags 0 :character-set 45))
+             (list :type mysql-type-blob :flags #x80 :character-set 45))
             "中文"))
     (should
      (equal (mysql--parse-typed-value
@@ -1914,17 +1915,17 @@ error 1049, but `mysql-connect' signaled an authentication error."
   "Test binary protocol type round-trips."
   (mysql-test--with-conn conn
     (mysql-query conn "CREATE TEMPORARY TABLE _mysql_el_bt (
-       i INT, f DOUBLE, s VARCHAR(100), d DATE, dt DATETIME)")
+       i INT, f DOUBLE, s VARCHAR(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin, d DATE, dt DATETIME)")
     (let ((stmt (mysql-prepare conn
                   "INSERT INTO _mysql_el_bt VALUES (?, ?, ?, '2024-03-15', '2024-03-15 10:30:00')")))
-      (mysql-execute stmt 42 3.14 "hello")
+      (mysql-execute stmt 42 3.14 "南京")
       (mysql-stmt-close stmt))
     (let ((result (mysql-query conn "SELECT * FROM _mysql_el_bt")))
       (let ((row (car (mysql-result-rows result))))
         (should (= (nth 0 row) 42))
         ;; Float comes back via text protocol
         (should (< (abs (- (nth 1 row) 3.14)) 0.001))
-        (should (equal (nth 2 row) "hello"))))))
+        (should (equal (nth 2 row) "南京"))))))
 
 ;;;; Live tests — TLS (require mysql-test-tls-enabled)
 
