@@ -69,6 +69,8 @@ session state:
 
 * Timeout recovery
 
+Use =mysql-query-rows-async= for large results. Its consumer gets ordered batches and column definitions outside the process filter. A consumer that returns the symbol =stop= or signals receives no further rows. The connection stays busy while the response drains. Use =KILL QUERY= from another connection to interrupt work still running on the server. The final callback reports a consumer error after draining; a successful result contains column definitions and no accumulated rows.
+
 When a query times out before its first response packet is complete, the
 connection rejects new commands until =mysql-drain-query-response= consumes the
 pending response.  If a timeout happens after result parsing has started, the

@@ -72,7 +72,7 @@ emacs -Q --batch --eval "(require 'package)" --eval "(package-initialize)" \
   abandoned response still awaits `mysql-drain-query-response`, refuses a new
   command before sending anything.
 - Every packet's sequence id is checked, and `mysql-max-message-bytes` and
-  `mysql-max-response-bytes` bound a message and a command response; a
+  `mysql-max-response-bytes` bound a message and a command response (undelivered payload for streaming queries); a
   violation closes the connection.
 - A query error is signaled only after its ERR packet has been consumed, so the
   connection stays usable.

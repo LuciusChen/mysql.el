@@ -4,6 +4,10 @@ Notable user-visible changes are recorded here.
 
 ## Unreleased
 
+### Added
+
+- `mysql-query-rows-async` delivers rows in batches while the query runs, with the same column definitions and values as an ordinary query.
+
 ### Fixed
 
 - Text columns with a binary collation now decode as text. Binary strings and GEOMETRY still return their original bytes.
