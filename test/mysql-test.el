@@ -2149,6 +2149,14 @@ connect's automatic TLS retry."
   :tags '(:mysql-live)
   "Stream ordered batches, including across waits and writer failures."
   (mysql-test--with-conn conn
+    (let (received outcome)
+      (cl-letf (((symbol-function 'discard)
+                 (lambda (rows _columns) (setq received rows))))
+        (mysql-query-rows-async conn "SELECT 42" 'discard
+                                (lambda (&rest args) (setq outcome args)))
+        (mysql-test--await (lambda () outcome))
+        (should-not (cadr outcome))
+        (should (equal received '((42))))))
     (dolist (mode '(read stop fail))
       (let ((sql "SELECT column_name AS n, REPEAT('x', 2048) AS s FROM information_schema.columns ORDER BY table_schema, table_name, ordinal_position LIMIT 200")
             (mysql-max-response-bytes 131072)

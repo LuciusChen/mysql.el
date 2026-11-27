@@ -1235,7 +1235,7 @@ A malformed packet signals."
                         (nreverse (mysql--query-response-rows response))))))
         ('err (setf (mysql--query-response-error response)
                     (list 'mysql-query-error (mysql--err-packet-message packet))))
-        (_ (unless (eq (mysql--query-response-consume response) 'discard)
+        (_ (unless (eq (mysql--query-response-consume response) :discard)
              (push (mysql--parse-result-row
                     packet count (mysql--query-response-types response))
                    (mysql--query-response-rows response)))))))
@@ -1323,7 +1323,7 @@ outside the process filter."
         ;; The writer can wait and disconnect CONN while processing a batch.
         (when (eq response (mysql-conn-async-response conn))
           (when (or failure stop)
-            (setf (mysql--query-response-consume response) 'discard
+            (setf (mysql--query-response-consume response) :discard
                   (mysql--query-response-consumer-error response) failure))
           (setf (mysql-conn-response-bytes conn) 0)
           (continue-process (mysql-conn-process conn))
@@ -1347,7 +1347,7 @@ outside the process filter."
               (stop-process (mysql-conn-process conn))
               (run-at-time 0 nil #'mysql--deliver-stream-rows conn response rows done)))
            (done (mysql--finish-async conn nil))
-           ((eq (mysql--query-response-consume response) 'discard)
+           ((eq (mysql--query-response-consume response) :discard)
             (setf (mysql-conn-response-bytes conn) 0))))
       (error (mysql--finish-async conn err)))))
 
