@@ -2,30 +2,19 @@
 
 [[https://melpa.org/#/mysql][file:https://melpa.org/packages/mysql-badge.svg]]
 
-A pure Emacs Lisp MySQL wire protocol client.  It speaks the
-classic MySQL protocol directly and does not shell out to the =mysql= CLI.
+A pure Emacs Lisp MySQL wire-protocol client. It talks to the server directly instead of shelling out to the =mysql= CLI.
 
-* Features
+* Requirements and installation
 
-- TLS connections
-- Authentication with =mysql_native_password= and =caching_sha2_password=;
-  other server plugins such as =sha256_password= are reported as unsupported
-- Prepared statements
-- Server-side prepared statement cursors with =mysql-execute-cursor= and =mysql-fetch=
-- Transactions
-- Public transaction helpers: =mysql-autocommit-p=, =mysql-in-transaction-p=,
-  =mysql-set-autocommit=, =mysql-commit=, and =mysql-rollback=
-- Public connection state helpers: =mysql-live-p=, =mysql-busy-p=,
-  =mysql-connection-id=, =mysql-current-database=, =mysql-select-database=, and
-  =mysql-refresh-current-database=, which records the database a =USE= run
-  through =mysql-query= chose
-- Public response drain helper for clients that cancel a running query out of
-  band: =mysql-drain-query-response=
-- Asynchronous text queries with =mysql-query-async= and =mysql-async-pending-p=
-- Percent-decoded =mysql://= connection URIs through =mysql-connect-uri=
-- Support for MySQL 5.6+, MySQL 8.x, and MariaDB 10.11
+Requires Emacs 28.1 or newer, with no external CLI or third-party Lisp dependencies. Tested against MySQL 5.6+, MySQL 8.x, and MariaDB 10.11.
 
-* Usage
+Install =mysql= from MELPA:
+
+#+begin_src emacs-lisp
+(package-install 'mysql)
+#+end_src
+
+* Basic usage
 
 #+begin_src emacs-lisp
 (require 'mysql)
@@ -41,10 +30,19 @@ classic MySQL protocol directly and does not shell out to the =mysql= CLI.
     (mysql-disconnect conn)))
 #+end_src
 
-Transaction helpers are available when you want explicit control over the
-session state:
+You can also connect with a percent-decoded =mysql://= URI via =mysql-connect-uri=, or scope a connection with =with-mysql-connection=.
 
-=mysql-in-transaction-p= and =mysql-autocommit-p= track server status from completed text and prepared query results as well as OK responses. In particular, a result-set query that opens a transaction in manual mode is visible to callers without issuing another query.
+** TLS and authentication
+
+Supports =mysql_native_password= and =caching_sha2_password= (other server plugins such as =sha256_password= signal an error). Pass =:tls t= to require TLS via Emacs GnuTLS, or =:ssl-mode 'disabled= (alias =off=) to stay on plaintext and skip automatic MySQL 8 TLS retries. TLS verification is on by default and configured via =mysql-tls-verify-server=, =mysql-tls-trustfiles=, and =mysql-tls-keylist=.
+
+** Prepared statements and cursors
+
+Use =mysql-prepare=, =mysql-execute=, and =mysql-stmt-close= for prepared statements, or =mysql-execute-cursor=, =mysql-fetch=, and =mysql-cursor-close= for server-side cursors.
+
+Prepared integer parameters support the full signed and unsigned 64-bit range; values outside that range signal =mysql-stmt-error= before anything is sent.
+
+** Transactions and session state
 
 #+begin_src emacs-lisp
 (mysql-set-autocommit conn nil)
@@ -55,9 +53,11 @@ session state:
   (mysql-set-autocommit conn t))
 #+end_src
 
-* Asynchronous queries
+=mysql-autocommit-p= and =mysql-in-transaction-p= track server status flags from completed text queries, prepared queries, and OK responses, so a result-set query that opens a transaction in manual mode is reflected immediately without an extra round trip. Other helpers include =with-mysql-transaction=, =mysql-rollback=, =mysql-ping=, =mysql-live-p=, =mysql-busy-p=, =mysql-connection-id=, =mysql-current-database=, =mysql-select-database=, =mysql-refresh-current-database= (which updates the recorded database after a raw =USE= query), =mysql-escape-identifier=, and =mysql-escape-literal=.
 
-=mysql-query-async= sends a text query and returns at once.  Its callback runs exactly once, from a timer, with the =mysql-result= and nil, or with nil and an error condition.  Until then the connection is busy and refuses other commands; =mysql-async-pending-p= reports whether a query is still waiting for its response.  After a =mysql-query-error= the connection stays usable, and after any other error it is closed.  The read idle timeout does not apply: to stop a query early, run =KILL QUERY= with its =mysql-connection-id= on another connection, and the callback receives the server's verdict.
+* Asynchronous and streaming queries
+
+=mysql-query-async= sends a text query without blocking and calls its callback once from a timer with =(result error)= (where =result= is a =mysql-result= or =nil=). While a query is in flight, =mysql-async-pending-p= returns non-nil and the connection rejects other commands. After a =mysql-query-error= the connection stays usable; any other error closes it. The read-idle timeout does not apply to async queries; stop a slow query by running =KILL QUERY= with its =mysql-connection-id= on another connection, and the callback will receive the server's error.
 
 #+begin_src emacs-lisp
 (mysql-query-async conn "SELECT COUNT(*) FROM orders"
@@ -67,25 +67,11 @@ session state:
                        (message "Rows: %S" (mysql-result-rows result)))))
 #+end_src
 
-* Timeout recovery
+For large results, use =mysql-query-rows-async= to stream ordered row batches and column definitions to a consumer outside the process filter. If the consumer returns =stop= or signals an error, it stops receiving rows while the remaining response drains (use =KILL QUERY= on another connection to interrupt the server). A successful final callback receives the column definitions without accumulating rows in memory.
 
-Use =mysql-query-rows-async= for large results. Its consumer gets ordered batches and column definitions outside the process filter. A consumer that returns the symbol =stop= or signals receives no further rows. The connection stays busy while the response drains. Use =KILL QUERY= from another connection to interrupt work still running on the server. The final callback reports a consumer error after draining; a successful result contains column definitions and no accumulated rows.
+* Timeouts and interrupted connections
 
-When a query times out before its first response packet is complete, the
-connection rejects new commands until =mysql-drain-query-response= consumes the
-pending response.  If a timeout happens after result parsing has started, the
-connection is closed because the generic drain API cannot safely reconstruct
-the partially consumed result set.
-
-Prepared integer parameters preserve the full signed and unsigned 64-bit range. Values outside that combined range raise =mysql-stmt-error= before transmission. Quitting or otherwise abandoning authentication releases the partially established connection and its process buffer.
-
-* Installation
-
-Install =mysql= from MELPA:
-
-#+begin_src emacs-lisp
-(package-install 'mysql)
-#+end_src
+If a synchronous query times out before its first response packet finishes arriving, the connection refuses new commands until =mysql-drain-query-response= consumes the pending reply. If it times out after result parsing has already started, the connection is closed instead because the stream position can no longer be safely recovered. Quitting or aborting during authentication closes the partial connection and cleans up its process buffer.
 
 * License
 
