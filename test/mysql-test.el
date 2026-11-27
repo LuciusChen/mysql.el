@@ -2145,6 +2145,45 @@ connect's automatic TLS retry."
       (should (equal (mysql-result-rows (car outcome)) '((0))))
       (should (equal (mysql-result-rows (mysql-query conn "SELECT 1")) '((1)))))))
 
+(ert-deftest mysql-test-live-streamed-query-drains-before-reuse ()
+  :tags '(:mysql-live)
+  "Stream ordered batches, including across waits and writer failures."
+  (mysql-test--with-conn conn
+    (let (received outcome)
+      (cl-letf (((symbol-function 'discard)
+                 (lambda (rows _columns) (setq received rows))))
+        (mysql-query-rows-async conn "SELECT 42" 'discard
+                                (lambda (&rest args) (setq outcome args)))
+        (mysql-test--await (lambda () outcome))
+        (should-not (cadr outcome))
+        (should (equal received '((42))))))
+    (dolist (mode '(read stop fail))
+      (let ((sql "SELECT column_name AS n, REPEAT('x', 2048) AS s FROM information_schema.columns ORDER BY table_schema, table_name, ordinal_position LIMIT 200")
+            (mysql-max-response-bytes 131072)
+            (read-process-output-max 16384)
+            outcome batches)
+        (mysql-query-rows-async
+         conn sql
+         (lambda (rows columns)
+           (should (mysql-busy-p conn))
+           (should (equal (mapcar (lambda (c) (plist-get c :name)) columns) '("n" "s")))
+           (push rows batches)
+           (accept-process-output nil 0.002)
+           (pcase mode ('fail (error "Writer failed")) ('stop 'stop)))
+         (lambda (result err) (setq outcome (list result err))))
+        (mysql-test--await (lambda () outcome))
+        (if (eq mode 'fail)
+            (should (equal outcome '(nil (error "Writer failed"))))
+          (should-not (cadr outcome))
+          (should-not (mysql-result-rows (car outcome))))
+        (if (eq mode 'read)
+            (let ((rows (apply #'append (nreverse batches))))
+              (should (= (length rows) 200))
+              (let ((mysql-max-response-bytes (* 1024 1024)))
+                (should (equal rows (mysql-result-rows (mysql-query conn sql))))))
+          (should (= (length batches) 1)))
+        (should (equal (mysql-result-rows (mysql-query conn "SELECT 1")) '((1))))))))
+
 (ert-deftest mysql-test-live-async-kill-query-reports-the-server-verdict ()
   :tags '(:mysql-live)
   "KILL QUERY should finish an asynchronous query with the server's error."

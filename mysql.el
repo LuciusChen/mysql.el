@@ -114,7 +114,8 @@ The limit includes all payload fragments of a multi-packet message."
   :group 'mysql)
 
 (defcustom mysql-max-response-bytes (* 128 1024 1024)
-  "Maximum payload bytes accepted for one command response."
+  "Maximum payload bytes accepted for one command response.
+For streamed rows, count the bytes since the last batch delivered."
   :type 'integer
   :group 'mysql)
 
@@ -1195,7 +1196,7 @@ SALT is the nonce, AUTH-PLUGIN is the current auth plugin name."
                (:copier nil))
   "Progress of one COM_QUERY response.
 CALLBACK is set only for an asynchronous query."
-  column-count columns types rows result error callback)
+  column-count columns types rows result error callback consume consumer-error)
 
 (defun mysql--query-response-step (conn response packet)
   "Advance COM_QUERY RESPONSE on CONN with PACKET.
@@ -1230,12 +1231,14 @@ A malformed packet signals."
                (make-mysql-result
                 :connection conn
                 :columns (mysql--query-response-columns response)
-                :rows (nreverse (mysql--query-response-rows response)))))
+                :rows (unless (mysql--query-response-consume response)
+                        (nreverse (mysql--query-response-rows response))))))
         ('err (setf (mysql--query-response-error response)
                     (list 'mysql-query-error (mysql--err-packet-message packet))))
-        (_ (push (mysql--parse-result-row
-                  packet count (mysql--query-response-types response))
-                 (mysql--query-response-rows response))))))
+        (_ (unless (eq (mysql--query-response-consume response) :discard)
+             (push (mysql--parse-result-row
+                    packet count (mysql--query-response-types response))
+                   (mysql--query-response-rows response)))))))
     (or (mysql--query-response-result response)
         (mysql--query-response-error response))))
 
@@ -1302,20 +1305,60 @@ outside the process filter."
     (when error
       (mysql--cleanup-connection-resources
        (mysql-conn-process conn) (mysql-conn-buf conn)))
-    (run-at-time 0 nil (mysql--query-response-callback response)
-                 (and (not error) (mysql--query-response-result response))
-                 (or error (mysql--query-response-error response)))))
+    (let ((failure (or (mysql--query-response-consumer-error response)
+                       error (mysql--query-response-error response))))
+      (run-at-time 0 nil (mysql--query-response-callback response)
+                   (unless failure (mysql--query-response-result response)) failure))))
+
+(defun mysql--deliver-stream-rows (conn response rows done)
+  "Deliver ROWS outside the filter, then resume CONN or finish RESPONSE if DONE."
+  (when (eq response (mysql-conn-async-response conn))
+    (let ((failure '(mysql-error "Row consumer exited before returning")) stop)
+      (unwind-protect
+          (condition-case err
+              (setq stop (eq 'stop (funcall (mysql--query-response-consume response)
+                                            rows (mysql--query-response-columns response)))
+                    failure nil)
+            ((error quit) (setq failure err)))
+        ;; The writer can wait and disconnect CONN while processing a batch.
+        (when (eq response (mysql-conn-async-response conn))
+          (when (or failure stop)
+            (setf (mysql--query-response-consume response) :discard
+                  (mysql--query-response-consumer-error response) failure))
+          (setf (mysql-conn-response-bytes conn) 0)
+          (continue-process (mysql-conn-process conn))
+          (when done (mysql--finish-async conn nil)))))))
 
 (defun mysql--advance-async (conn)
   "Feed the whole packets buffered on CONN to its asynchronous query."
   (when-let* ((response (mysql-conn-async-response conn)))
     (condition-case err
-        (while (and (mysql-conn-async-response conn)
-                    (mysql--packet-available-p conn))
-          (when (mysql--query-response-step
-                 conn response (mysql--read-packet conn))
-            (mysql--finish-async conn nil)))
+        (let (done)
+          (while (and (not done) (mysql--packet-available-p conn))
+            (setq done (mysql--query-response-step
+                        conn response (mysql--read-packet conn))))
+          (cond
+           ((and (functionp (mysql--query-response-consume response))
+                 (mysql--query-response-rows response))
+            ;; A file writer can wait for network I/O.  Leave further bytes
+            ;; on the socket until it returns, even if it runs other timers.
+            (let ((rows (nreverse (mysql--query-response-rows response))))
+              (setf (mysql--query-response-rows response) nil)
+              (stop-process (mysql-conn-process conn))
+              (run-at-time 0 nil #'mysql--deliver-stream-rows conn response rows done)))
+           (done (mysql--finish-async conn nil))
+           ((eq (mysql--query-response-consume response) :discard)
+            (setf (mysql-conn-response-bytes conn) 0))))
       (error (mysql--finish-async conn err)))))
+
+(defun mysql-query-rows-async (conn sql function callback)
+  "Execute SQL once on CONN, delivering decoded rows to FUNCTION.
+Call FUNCTION with each nonempty batch and its column definitions, outside
+the process filter.  Returning \='stop or signaling stops delivery; the
+connection drains the remaining response before CALLBACK.  A consumer
+error is reported to CALLBACK.  The final result has columns and no rows.
+As in `mysql-query-async', the connection is busy until completion."
+  (mysql--start-query-async conn sql callback function))
 
 (defun mysql-query-async (conn sql callback)
   "Start SQL on CONN and return nil without waiting for its response.
@@ -1328,11 +1371,15 @@ idle when CALLBACK runs.  KILL QUERY from another connection stops the
 query, which then completes with the server's verdict.  The read idle
 timeout does not apply.  When sending SQL fails or is quit, signal at
 once without calling CALLBACK; CONN is then closed."
+  (mysql--start-query-async conn sql callback nil))
+
+(defun mysql--start-query-async (conn sql callback consume)
+  "Send SQL on CONN for CALLBACK, streaming rows when CONSUME is non-nil."
   (mysql--ensure-command-ready conn "query")
   (setf (mysql-conn-busy conn) t
         (mysql-conn-response-bytes conn) 0
         (mysql-conn-async-response conn)
-        (mysql--make-query-response :callback callback))
+        (mysql--make-query-response :callback callback :consume consume))
   (let (sent)
     (unwind-protect
         (progn
